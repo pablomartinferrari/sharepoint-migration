@@ -1,0 +1,21 @@
+{
+  "TenantId": "your-tenant-id-here",
+  "ClientId": "your-client-id-here",
+  "Thumbprint": "your-certificate-thumbprint-here",
+  "SharePointSiteUrl": "https://yourtenant.sharepoint.com/sites/yoursite",
+  "FileServerPath": "G:\\shared\\clients",
+  "LibraryName": "Documents",
+  "StartDate": "2024-01-01",
+  "EndDate": null
+}
+
+// Path Mapping:
+// - File Server: G:\shared\clients\client 1\my doc.pdf
+// - Root Path: G:\shared\clients
+// - SharePoint Path: clients\client 1\my doc.pdf
+// The last folder name in FileServerPath ("clients") will be included in SharePoint paths
+
+// Date Filtering (optional):
+// - StartDate: Include files created/modified after this date (format: "YYYY-MM-DD" or "YYYY-MM-DD HH:MM:SS")
+// - EndDate: Include files created/modified before this date. If null, defaults to current date/time
+// Files are included if their Created OR Modified date falls within the range
