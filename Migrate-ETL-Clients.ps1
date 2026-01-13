@@ -236,8 +236,15 @@ if (-not $spList) {
 Write-Host "`nStep 3: Checking existing files in SharePoint..." -ForegroundColor Cyan
 $filesToMigrate = @()
 $existingCount = 0
+$checkCount = 0
 
 foreach ($file in $files) {
+    $checkCount++
+    if ($checkCount % 100 -eq 0) {
+        Write-Host "  Checking files: $checkCount of $($files.Count)..." -ForegroundColor Gray
+        [Console]::Out.Flush()
+    }
+    
     $spPath = $file.SharePointPath -replace '\\', '/'
     $libraryRootUrl = $spList.RootFolder.ServerRelativeUrl.TrimEnd('/')
     $checkUrl = "$libraryRootUrl/$spPath"
@@ -277,6 +284,10 @@ if ($Migrate) {
             $percent = [Math]::Round(($currentFile / $filesToMigrate.Count) * 100, 1)
             
             Write-Host "  [$currentFile/$($filesToMigrate.Count)] ($percent%) Uploading: $($file.RelativePath)" -ForegroundColor Cyan
+            Write-Host "    Starting upload..." -ForegroundColor Gray
+            
+            # Flush output buffer to ensure message appears immediately
+            [Console]::Out.Flush()
             
             $result = Copy-FileToSharePoint -SourcePath $file.FullPath -SharePointPath $file.SharePointPath -List $spList
             
@@ -288,6 +299,9 @@ if ($Migrate) {
                 Write-Host "    ✗ Failed: $($result.Error)" -ForegroundColor Red
                 $failedCount++
             }
+            
+            # Flush after each file to ensure progress is visible
+            [Console]::Out.Flush()
         }
         
         Write-Host "`n=== Migration Results ===" -ForegroundColor Yellow
