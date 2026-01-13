@@ -23,6 +23,14 @@ param(
     [Parameter(Mandatory = $false)]
     [int]$PreviewCount = 25,
 
+    # Optional date filter: only consider files created/modified on/after StartDate (local time)
+    [Parameter(Mandatory = $false)]
+    [DateTime]$StartDate,
+
+    # Optional date filter: only consider files created/modified on/before EndDate (local time)
+    [Parameter(Mandatory = $false)]
+    [DateTime]$EndDate,
+
     # Safety: stop after N upload attempts (success or fail). 0 means no limit.
     [Parameter(Mandatory = $false)]
     [int]$StopAfter = 0,
@@ -347,6 +355,8 @@ Write-MigrationLog -Level "INFO" -Message "Starting migration run" -Data @{
     TargetBasePath        = "$targetSharePointBasePath/$targetRootFolderName"
     Migrate               = [bool]$Migrate
     PreviewCount          = $PreviewCount
+    StartDate             = if ($StartDate) { $StartDate.ToString("o") } else { $null }
+    EndDate               = if ($EndDate) { $EndDate.ToString("o") } else { $null }
     StopAfter             = $StopAfter
     FailFast              = [bool]$FailFast
     IncludeCanMigrate     = [bool]$IncludeCanMigrate
@@ -356,9 +366,26 @@ Write-MigrationLog -Level "INFO" -Message "Starting migration run" -Data @{
 Write-Host "Step 1: Scanning source folder..." -ForegroundColor Cyan
 $files = @()
 $fileCount = 0
+$skippedByDateCount = 0
 
 Get-ChildItem -Path $sourcePath -Recurse -File -ErrorAction SilentlyContinue | ForEach-Object {
     $fileCount++
+
+    # Optional date filter: include a file if its Created OR Modified falls within the range.
+    if ($StartDate -or $EndDate) {
+        $created = $_.CreationTime
+        $modified = $_.LastWriteTime
+
+        if ($StartDate -and ($created -lt $StartDate) -and ($modified -lt $StartDate)) {
+            $skippedByDateCount++
+            return
+        }
+        if ($EndDate -and ($created -gt $EndDate) -and ($modified -gt $EndDate)) {
+            $skippedByDateCount++
+            return
+        }
+    }
+
     $relativePath = $_.FullName -replace [regex]::Escape($sourcePath), ""
     $relativePath = $relativePath.TrimStart('\', '/')
     
@@ -382,7 +409,16 @@ Get-ChildItem -Path $sourcePath -Recurse -File -ErrorAction SilentlyContinue | F
 }
 
 Write-Host "Found $($files.Count) files to process" -ForegroundColor Green
-Write-MigrationLog -Level "INFO" -Message "Source scan complete" -Data @{ FileCount = $files.Count }
+if ($StartDate -or $EndDate) {
+    Write-Host "Date filter active. Skipped by date: $skippedByDateCount" -ForegroundColor Gray
+}
+Write-MigrationLog -Level "INFO" -Message "Source scan complete" -Data @{
+    TotalEnumerated = $fileCount
+    FileCount = $files.Count
+    SkippedByDate = $skippedByDateCount
+    StartDate = if ($StartDate) { $StartDate.ToString("o") } else { $null }
+    EndDate = if ($EndDate) { $EndDate.ToString("o") } else { $null }
+}
 
 # Step 2: Connect to SharePoint
 Write-Host "`nStep 2: Connecting to SharePoint..." -ForegroundColor Cyan
