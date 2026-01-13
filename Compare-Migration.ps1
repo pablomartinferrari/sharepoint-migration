@@ -150,6 +150,11 @@ function Get-SharePointFile {
     $libraryRootUrl = $libraryRootUrl.TrimEnd('/')
     $libraryName = $List.Title
     
+    # Debug: Show what we're working with
+    Write-Host "      Library root URL: $libraryRootUrl" -ForegroundColor DarkGray
+    Write-Host "      Library name: $libraryName" -ForegroundColor DarkGray
+    Write-Host "      SharePoint path: $spPath" -ForegroundColor DarkGray
+    
     # Construct the full server-relative URL for the file
     # SharePoint paths are typically: /sites/sitename/LibraryName/path/to/file.pdf
     $fullServerRelativeUrl = "$libraryRootUrl/$spPath"
@@ -160,25 +165,42 @@ function Get-SharePointFile {
     # Try to get the file directly using the constructed URL
     # Direct file access bypasses the 5000 item list view threshold
     try {
-        $file = Get-PnPFile -Url $fullServerRelativeUrl -ErrorAction Stop
-        if ($file) {
-            # Get list item metadata using the file's server-relative URL
-            # This is a targeted query by specific file URL, not a folder query, so it's safe
-            $fileItem = Get-PnPListItem -List $List -Query "<View><Query><Where><Eq><FieldRef Name='FileRef'/><Value Type='Text'>$($file.ServerRelativeUrl)</Value></Eq></Where></Query></View>" -ErrorAction SilentlyContinue | Select-Object -First 1
-            if ($fileItem) {
-                return @{
-                    Name = $fileItem.FieldValues.FileLeafRef
-                    Size = [long]$fileItem.FieldValues.File_x0020_Size
-                    Modified = [DateTime]$fileItem.FieldValues.Modified
-                    Path = $SharePointPath
-                    NormalizedPath = (Normalize-Path -Path $SharePointPath)
-                    CheckedUrl = $fullServerRelativeUrl
-                }
+        # First, try Get-PnPFile with -AsListItem to get both file and metadata in one call
+        $fileItem = Get-PnPFile -Url $fullServerRelativeUrl -AsListItem -ErrorAction Stop
+        if ($fileItem) {
+            return @{
+                Name = $fileItem.FieldValues.FileLeafRef
+                Size = [long]$fileItem.FieldValues.File_x0020_Size
+                Modified = [DateTime]$fileItem.FieldValues.Modified
+                Path = $SharePointPath
+                NormalizedPath = (Normalize-Path -Path $SharePointPath)
+                CheckedUrl = $fullServerRelativeUrl
             }
         }
     }
     catch {
-        # File not found at that exact path, try alternative approaches
+        # If -AsListItem doesn't work, try the regular Get-PnPFile
+        try {
+            $file = Get-PnPFile -Url $fullServerRelativeUrl -ErrorAction Stop
+            if ($file) {
+                # Get list item metadata using the file's server-relative URL
+                $fileItem = Get-PnPListItem -List $List -Query "<View><Query><Where><Eq><FieldRef Name='FileRef'/><Value Type='Text'>$($file.ServerRelativeUrl)</Value></Eq></Where></Query></View>" -ErrorAction SilentlyContinue | Select-Object -First 1
+                if ($fileItem) {
+                    return @{
+                        Name = $fileItem.FieldValues.FileLeafRef
+                        Size = [long]$fileItem.FieldValues.File_x0020_Size
+                        Modified = [DateTime]$fileItem.FieldValues.Modified
+                        Path = $SharePointPath
+                        NormalizedPath = (Normalize-Path -Path $SharePointPath)
+                        CheckedUrl = $fullServerRelativeUrl
+                    }
+                }
+            }
+        }
+        catch {
+            # File not found at that exact path, try alternative approaches
+            Write-Host "      Error: $($_.Exception.Message)" -ForegroundColor DarkRed
+        }
     }
     
     # Alternative: Try with different library name prefixes
@@ -192,25 +214,76 @@ function Get-SharePointFile {
     foreach ($testPath in $possiblePaths) {
         try {
             $testUrl = "$libraryRootUrl/$testPath"
-            $file = Get-PnPFile -Url $testUrl -ErrorAction Stop
-            if ($file) {
-                # Get list item metadata - targeted query by specific file URL (safe from 5000 limit)
-                $fileItem = Get-PnPListItem -List $List -Query "<View><Query><Where><Eq><FieldRef Name='FileRef'/><Value Type='Text'>$($file.ServerRelativeUrl)</Value></Eq></Where></Query></View>" -ErrorAction SilentlyContinue | Select-Object -First 1
+            Write-Host "      Trying alternative: $testUrl" -ForegroundColor DarkGray
+            # Try with -AsListItem first
+            $fileItem = Get-PnPFile -Url $testUrl -AsListItem -ErrorAction Stop
+            if ($fileItem) {
+                Write-Host "      ✓ Found at alternative URL" -ForegroundColor Green
+                return @{
+                    Name = $fileItem.FieldValues.FileLeafRef
+                    Size = [long]$fileItem.FieldValues.File_x0020_Size
+                    Modified = [DateTime]$fileItem.FieldValues.Modified
+                    Path = $SharePointPath
+                    NormalizedPath = (Normalize-Path -Path $SharePointPath)
+                    CheckedUrl = $testUrl
+                }
+            }
+        }
+        catch {
+            # Try regular Get-PnPFile if -AsListItem failed
+            try {
+                $file = Get-PnPFile -Url $testUrl -ErrorAction Stop
+                if ($file) {
+                    $fileItem = Get-PnPListItem -List $List -Query "<View><Query><Where><Eq><FieldRef Name='FileRef'/><Value Type='Text'>$($file.ServerRelativeUrl)</Value></Eq></Where></Query></View>" -ErrorAction SilentlyContinue | Select-Object -First 1
+                    if ($fileItem) {
+                        Write-Host "      ✓ Found at alternative URL" -ForegroundColor Green
+                        return @{
+                            Name = $fileItem.FieldValues.FileLeafRef
+                            Size = [long]$fileItem.FieldValues.File_x0020_Size
+                            Modified = [DateTime]$fileItem.FieldValues.Modified
+                            Path = $SharePointPath
+                            NormalizedPath = (Normalize-Path -Path $SharePointPath)
+                            CheckedUrl = $testUrl
+                        }
+                    }
+                }
+            }
+            catch {
+                continue
+            }
+        }
+    }
+    
+    # Last resort: Try using Get-PnPFolder to navigate to the folder, then get the file
+    try {
+        $pathParts = $spPath -split '/'
+        $fileName = $pathParts[-1]
+        $folderPathParts = $pathParts[0..($pathParts.Length - 2)]
+        $folderPath = $folderPathParts -join '/'
+        
+        if ($folderPath) {
+            $folderUrl = "$libraryRootUrl/$folderPath"
+            Write-Host "      Trying folder navigation: $folderUrl" -ForegroundColor DarkGray
+            $folder = Get-PnPFolder -Url $folderUrl -ErrorAction Stop
+            if ($folder) {
+                $fileUrl = "$folderUrl/$fileName"
+                $fileItem = Get-PnPFile -Url $fileUrl -AsListItem -ErrorAction Stop
                 if ($fileItem) {
+                    Write-Host "      ✓ Found via folder navigation" -ForegroundColor Green
                     return @{
                         Name = $fileItem.FieldValues.FileLeafRef
                         Size = [long]$fileItem.FieldValues.File_x0020_Size
                         Modified = [DateTime]$fileItem.FieldValues.Modified
                         Path = $SharePointPath
                         NormalizedPath = (Normalize-Path -Path $SharePointPath)
-                        CheckedUrl = $testUrl
+                        CheckedUrl = $fileUrl
                     }
                 }
             }
         }
-        catch {
-            continue
-        }
+    }
+    catch {
+        # Folder navigation failed
     }
     
     # Note: We don't use list queries as a fallback because they can hit the 5000 item limit
