@@ -236,7 +236,14 @@ function Get-FileServerFiles {
     $rootFolderName = Split-Path -Leaf $RootPath
     
     Write-Host "Root folder name: $rootFolderName" -ForegroundColor Gray
-    Write-Host "  Files will be mapped to SharePoint path: $rootFolderName\<relative path>" -ForegroundColor Gray
+    
+    # Show the correct SharePoint path mapping including SharePointBasePath if provided
+    if ($SharePointBasePath) {
+        Write-Host "  Files will be mapped to SharePoint path: $SharePointBasePath\$rootFolderName\<relative path>" -ForegroundColor Gray
+    }
+    else {
+        Write-Host "  Files will be mapped to SharePoint path: $rootFolderName\<relative path>" -ForegroundColor Gray
+    }
     
     $files = @{}
     $lockedFiles = @{}
