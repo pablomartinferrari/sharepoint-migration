@@ -25,11 +25,11 @@ param(
 
     # Optional date filter: only consider files created/modified on/after StartDate (local time)
     [Parameter(Mandatory = $false)]
-    [DateTime]$StartDate,
+    [Nullable[DateTime]]$StartDate = $null,
 
     # Optional date filter: only consider files created/modified on/before EndDate (local time)
     [Parameter(Mandatory = $false)]
-    [DateTime]$EndDate,
+    [Nullable[DateTime]]$EndDate = $null,
 
     # SharePoint + Windows timestamps can differ by milliseconds / timezone kind while printing the same.
     # Use a small tolerance to avoid false CanMigrate/Skip decisions.
@@ -386,18 +386,21 @@ Get-ChildItem -Path $sourcePath -Recurse -File -ErrorAction SilentlyContinue | F
     $fileCount++
 
     # Optional date filter: include a file if its Created OR Modified falls within the range.
-    if ($StartDate -or $EndDate) {
+    $start = if ($StartDate) { [DateTime]$StartDate } else { $null }
+    $end = if ($EndDate) { [DateTime]$EndDate } else { $null }
+
+    if ($start -or $end) {
         $created = $_.CreationTime
         $modified = $_.LastWriteTime
 
-        if ($StartDate -and ($created -lt $StartDate) -and ($modified -lt $StartDate)) {
+        if ($start -and ($created -lt $start) -and ($modified -lt $start)) {
             $skippedByDateCount++
             if ($fileCount % 1000 -eq 0) {
                 Write-Host "  Enumerated $fileCount files... kept $($files.Count), skipped by date $skippedByDateCount" -ForegroundColor Gray
             }
             return
         }
-        if ($EndDate -and ($created -gt $EndDate) -and ($modified -gt $EndDate)) {
+        if ($end -and ($created -gt $end) -and ($modified -gt $end)) {
             $skippedByDateCount++
             if ($fileCount % 1000 -eq 0) {
                 Write-Host "  Enumerated $fileCount files... kept $($files.Count), skipped by date $skippedByDateCount" -ForegroundColor Gray

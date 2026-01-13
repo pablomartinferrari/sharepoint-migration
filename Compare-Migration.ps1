@@ -35,10 +35,10 @@ param(
 
     # Optional date filter overrides (if not provided, config.StartDate/config.EndDate are used)
     [Parameter(Mandatory = $false)]
-    [DateTime]$StartDate,
+    [Nullable[DateTime]]$StartDate = $null,
 
     [Parameter(Mandatory = $false)]
-    [DateTime]$EndDate
+    [Nullable[DateTime]]$EndDate = $null
 )
 
 # Error handling
@@ -641,8 +641,8 @@ function Copy-FileToSharePoint {
 function Get-FileServerFiles {
     param(
         [string]$RootPath,
-        [DateTime]$StartDate = $null,
-        [DateTime]$EndDate = $null,
+        [Nullable[DateTime]]$StartDate = $null,
+        [Nullable[DateTime]]$EndDate = $null,
         [string]$SharePointBasePath = $null,  # Optional prefix path in SharePoint (e.g., "etc")
         [object]$FolderNameTransform = $null,  # Optional folder name transformation config
         [scriptblock]$ProcessFileCallback = $null  # Optional callback to process each file as it's found
