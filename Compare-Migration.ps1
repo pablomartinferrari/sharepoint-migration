@@ -26,7 +26,12 @@ param(
     [string]$ReportPath = $null,
     
     [Parameter(Mandatory = $false)]
-    [switch]$Migrate  # If specified, will migrate files after comparison
+    [switch]$Migrate,  # If specified, will migrate files after comparison
+
+    # SharePoint + Windows timestamps can differ by milliseconds / timezone kind while printing the same in CSV.
+    # Use a small tolerance to avoid false NewerOnServer/NewerInSharePoint classifications.
+    [Parameter(Mandatory = $false)]
+    [double]$TimestampToleranceSeconds = 2
 )
 
 # Error handling
@@ -944,7 +949,9 @@ $processFileCallback = {
     
     if ($spFile) {
         # File exists in SharePoint - compare modification dates
-        if ($FileData.Modified -gt $spFile.Modified) {
+        $modifiedDeltaSeconds = ($FileData.Modified - $spFile.Modified).TotalSeconds
+
+        if ($modifiedDeltaSeconds -gt $TimestampToleranceSeconds) {
             # File is newer on server - can be migrated
             $result = [PSCustomObject]@{
                 Status = "NewerOnServer"
@@ -954,6 +961,7 @@ $processFileCallback = {
                 ServerModified = $FileData.Modified
                 SharePointSize = $spFile.Size
                 SharePointModified = $spFile.Modified
+                ModifiedDeltaSeconds = [Math]::Round($modifiedDeltaSeconds, 3)
                 Action = "CanMigrate"
             }
             $script:results += $result
@@ -971,7 +979,7 @@ $processFileCallback = {
                 }
             }
         }
-        elseif ($spFile.Modified -gt $FileData.Modified) {
+        elseif ($modifiedDeltaSeconds -lt (-1 * $TimestampToleranceSeconds)) {
             # File is newer in SharePoint - skip to avoid overwriting
             $result = [PSCustomObject]@{
                 Status = "NewerInSharePoint"
@@ -981,6 +989,7 @@ $processFileCallback = {
                 ServerModified = $FileData.Modified
                 SharePointSize = $spFile.Size
                 SharePointModified = $spFile.Modified
+                ModifiedDeltaSeconds = [Math]::Round($modifiedDeltaSeconds, 3)
                 Action = "Skip"
             }
             $script:results += $result
@@ -998,6 +1007,7 @@ $processFileCallback = {
                     ServerModified = $FileData.Modified
                     SharePointSize = $spFile.Size
                     SharePointModified = $spFile.Modified
+                    ModifiedDeltaSeconds = [Math]::Round($modifiedDeltaSeconds, 3)
                     Action = "Review"
                 }
                 $script:results += $result
