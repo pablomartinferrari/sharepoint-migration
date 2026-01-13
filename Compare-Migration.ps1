@@ -154,6 +154,9 @@ function Get-SharePointFile {
     # SharePoint paths are typically: /sites/sitename/LibraryName/path/to/file.pdf
     $fullServerRelativeUrl = "$libraryRootUrl/$spPath"
     
+    # Store the primary URL being checked for logging
+    $primaryUrl = $fullServerRelativeUrl
+    
     # Try to get the file directly using the constructed URL
     # Direct file access bypasses the 5000 item list view threshold
     try {
@@ -169,6 +172,7 @@ function Get-SharePointFile {
                     Modified = [DateTime]$fileItem.FieldValues.Modified
                     Path = $SharePointPath
                     NormalizedPath = (Normalize-Path -Path $SharePointPath)
+                    CheckedUrl = $fullServerRelativeUrl
                 }
             }
         }
@@ -199,6 +203,7 @@ function Get-SharePointFile {
                         Modified = [DateTime]$fileItem.FieldValues.Modified
                         Path = $SharePointPath
                         NormalizedPath = (Normalize-Path -Path $SharePointPath)
+                        CheckedUrl = $testUrl
                     }
                 }
             }
@@ -211,6 +216,7 @@ function Get-SharePointFile {
     # Note: We don't use list queries as a fallback because they can hit the 5000 item limit
     # Direct file access (Get-PnPFile -Url) is the only reliable method for large folders
     # If the file wasn't found via direct URL, it likely doesn't exist at that path
+    # Return null with the URL that was checked for logging
     return $null
 }
 
@@ -507,12 +513,23 @@ foreach ($filePath in $fileServerFiles.Keys) {
     $serverFile = $fileServerFiles[$filePath]
     $checkedCount++
     
+    # Get the library root URL for logging
+    $libraryRootUrl = $spList.RootFolder.ServerRelativeUrl.TrimEnd('/')
+    $spPathForUrl = $serverFile.SharePointPath -replace '\\', '/'
+    $checkUrl = "$libraryRootUrl/$spPathForUrl"
+    
+    # Log the file being checked
+    Write-Host "  [$checkedCount/$totalFiles] Checking: $($serverFile.SharePointPath)" -ForegroundColor DarkGray
+    Write-Host "    SharePoint URL: $checkUrl" -ForegroundColor DarkGray
+    
     # Check if this specific file exists in SharePoint
     # This uses Get-PnPFile -Url which directly accesses the file by URL,
     # bypassing the 5000 item list view threshold
     $spFile = Get-SharePointFile -SiteUrl $config.SharePointSiteUrl -List $spList -SharePointPath $serverFile.SharePointPath
     
     if ($spFile) {
+        $foundUrl = if ($spFile.CheckedUrl) { $spFile.CheckedUrl } else { $checkUrl }
+        Write-Host "    ✓ Found in SharePoint at: $foundUrl" -ForegroundColor Green
         # File exists in SharePoint - compare modification dates
         if ($serverFile.Modified -gt $spFile.Modified) {
             # File is newer on server - can be migrated
@@ -564,6 +581,7 @@ foreach ($filePath in $fileServerFiles.Keys) {
     }
     else {
         # File doesn't exist in SharePoint - needs migration
+        Write-Host "    ✗ Not found in SharePoint (will be migrated)" -ForegroundColor Yellow
         $results += [PSCustomObject]@{
             Status = "Missing"
             FilePath = $filePath
@@ -582,6 +600,15 @@ foreach ($filePath in $fileServerFiles.Keys) {
         $percentComplete = [Math]::Round(($checkedCount / $totalFiles) * 100, 1)
         Write-Host "  Checked $checkedCount of $totalFiles files ($percentComplete%)..." -ForegroundColor Gray
     }
+}
+
+# Show completion message if not already shown (when total is not a multiple of 100)
+if ($checkedCount % 100 -ne 0) {
+    $percentComplete = [Math]::Round(($checkedCount / $totalFiles) * 100, 1)
+    Write-Host "  Checked $checkedCount of $totalFiles files ($percentComplete%) - completed!" -ForegroundColor Gray
+}
+else {
+    Write-Host "  Completed checking all $totalFiles files!" -ForegroundColor Green
 }
 
 # Add locked files to results
