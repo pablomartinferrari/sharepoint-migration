@@ -9,16 +9,48 @@ param(
     [string]$ConfigPath,
     
     [Parameter(Mandatory = $false)]
-    [switch]$Migrate
+    [switch]$Migrate,
+
+    # Override the file server root. By default we DO NOT take this from config to avoid surprises.
+    [Parameter(Mandatory = $false)]
+    [string]$SourcePath = "\\etlrom-dc1\lab\shared\clients (etc - wilco)",
+
+    # Override the library-relative base path. By default we DO NOT take this from config.
+    [Parameter(Mandatory = $false)]
+    [string]$SharePointBasePath = "ETL",
+
+    # How many planned mappings to show + log early (helps validate destination quickly)
+    [Parameter(Mandatory = $false)]
+    [int]$PreviewCount = 25,
+
+    # Safety: stop after N upload attempts (success or fail). 0 means no limit.
+    [Parameter(Mandatory = $false)]
+    [int]$StopAfter = 0,
+
+    # Safety: stop immediately on first upload failure
+    [Parameter(Mandatory = $false)]
+    [switch]$FailFast,
+
+    # Include files that already exist in SharePoint but are newer on the file server (overwrite SharePoint copy)
+    [Parameter(Mandatory = $false)]
+    [switch]$IncludeCanMigrate,
+
+    # Log file (JSONL). Defaults to a timestamped file under .\logs
+    [Parameter(Mandatory = $false)]
+    [string]$LogPath
 )
 
 # Error handling
 $ErrorActionPreference = "Stop"
 
-# Get paths from config (or use hardcoded defaults)
-$sourcePath = if ($config.FileServerPath) { $config.FileServerPath } else { "\\etlrom-dc1\lab\shared\clients (etc - wilco)" }
-$targetSharePointBasePath = if ($config.SharePointBasePath) { $config.SharePointBasePath } else { "ETL" }
-$targetRootFolderName = "Clients"  # Always transform root folder to "Clients"
+# Ensure we have a log path early
+if (-not $LogPath) {
+    $LogPath = Join-Path -Path "." -ChildPath ("logs\etl-clients-migration-{0}.jsonl" -f (Get-Date -Format "yyyyMMdd-HHmmss"))
+}
+$logDir = Split-Path -Parent $LogPath
+if ($logDir -and -not (Test-Path $logDir)) {
+    New-Item -ItemType Directory -Path $logDir -Force | Out-Null
+}
 
 # Load configuration
 Write-Host "Loading configuration from $ConfigPath..." -ForegroundColor Cyan
@@ -27,6 +59,11 @@ if (-not (Test-Path $ConfigPath)) {
 }
 
 $config = Get-Content $ConfigPath | ConvertFrom-Json
+
+# Paths: intentionally ignore config-provided paths to avoid accidentally nesting under "Documents"/"Shared Documents"
+$sourcePath = $SourcePath
+$targetSharePointBasePath = Sanitize-LibraryRelativePath -Path $SharePointBasePath
+$targetRootFolderName = "Clients"  # Always transform root folder to "Clients"
 
 # Validate configuration
 $requiredFields = @('TenantId', 'ClientId', 'Thumbprint', 'SharePointSiteUrl')
@@ -139,6 +176,59 @@ function Normalize-Path {
     return $normalized
 }
 
+# Function to sanitize a library-relative path (do not allow "Documents"/"Shared Documents" prefixes)
+function Sanitize-LibraryRelativePath {
+    param([string]$Path)
+
+    if (-not $Path) {
+        return $Path
+    }
+
+    $p = $Path.Trim()
+    $p = $p -replace '\\', '/'
+    $p = $p.Trim('/')
+
+    if (-not $p) {
+        return $p
+    }
+
+    $parts = $p -split '/'
+    $filtered = @()
+    foreach ($part in $parts) {
+        if (-not $part) { continue }
+        $filtered += $part
+    }
+
+    # If someone accidentally included the library name in the "base path", remove it.
+    while ($filtered.Count -gt 0 -and ($filtered[0] -ieq 'documents' -or $filtered[0] -ieq 'shared documents')) {
+        $filtered = $filtered[1..($filtered.Count - 1)]
+    }
+
+    return ($filtered -join '/')
+}
+
+# Structured logger (JSONL). Safe for long runs and easy to tail/grep.
+function Write-MigrationLog {
+    param(
+        [string]$Level,
+        [string]$Message,
+        [hashtable]$Data
+    )
+
+    $evt = [ordered]@{
+        ts      = (Get-Date).ToString("o")
+        level   = $Level
+        message = $Message
+    }
+    if ($Data) {
+        foreach ($k in $Data.Keys) {
+            $evt[$k] = $Data[$k]
+        }
+    }
+
+    ($evt | ConvertTo-Json -Compress) | Add-Content -Path $LogPath -Encoding UTF8
+}
+
 # Function to ensure folder exists in SharePoint
 function Ensure-SharePointFolder {
     param(
@@ -152,15 +242,7 @@ function Ensure-SharePointFolder {
     
     $spFolderPath = $FolderPath -replace '\\', '/'
     $libraryRootUrl = $List.RootFolder.ServerRelativeUrl.TrimEnd('/')
-    $libraryName = $List.Title
-    
-    # If library is "Shared Documents", folders are often under a "Documents" subfolder
-    if ($libraryName -eq "Shared Documents" -and $spFolderPath -notmatch '^Documents/') {
-        $fullFolderPath = "$libraryRootUrl/Documents/$spFolderPath"
-    }
-    else {
-        $fullFolderPath = "$libraryRootUrl/$spFolderPath"
-    }
+    $fullFolderPath = "$libraryRootUrl/$spFolderPath"
     
     try {
         $folder = Get-PnPFolder -Url $fullFolderPath -ErrorAction Stop
@@ -170,22 +252,8 @@ function Ensure-SharePointFolder {
     }
     catch {
         # Folder doesn't exist, create it
-        # If library is "Shared Documents", we need to ensure "Documents" subfolder exists first
         $pathParts = $spFolderPath -split '/'
         $currentPath = $libraryRootUrl
-        
-        # If library is "Shared Documents", start with the "Documents" subfolder
-        if ($libraryName -eq "Shared Documents") {
-            $documentsPath = "$libraryRootUrl/Documents"
-            try {
-                $documentsFolder = Get-PnPFolder -Url $documentsPath -ErrorAction Stop
-                $currentPath = $documentsPath
-            }
-            catch {
-                # Documents subfolder doesn't exist, but we'll let it be created naturally as we traverse
-                # Just start from library root and it will be created if needed
-            }
-        }
         
         foreach ($part in $pathParts) {
             if ($part) {
@@ -217,7 +285,8 @@ function Copy-FileToSharePoint {
     param(
         [string]$SourcePath,
         [string]$SharePointPath,
-        [Microsoft.SharePoint.Client.List]$List
+        [Microsoft.SharePoint.Client.List]$List,
+        [switch]$Overwrite
     )
     
     if (-not (Test-Path $SourcePath)) {
@@ -237,22 +306,20 @@ function Copy-FileToSharePoint {
         }
         
         $libraryRootUrl = $List.RootFolder.ServerRelativeUrl.TrimEnd('/')
-        $libraryName = $List.Title
         
-        # If library is "Shared Documents", folders are often under a "Documents" subfolder
         if ($folderPath) {
-            if ($libraryName -eq "Shared Documents" -and $folderPath -notmatch '^Documents/') {
-                $targetFolderUrl = "$libraryRootUrl/Documents/$folderPath"
-            }
-            else {
-                $targetFolderUrl = "$libraryRootUrl/$folderPath"
-            }
+            $targetFolderUrl = "$libraryRootUrl/$folderPath"
         }
         else {
             $targetFolderUrl = $libraryRootUrl
         }
         
-        $file = Add-PnPFile -Path $SourcePath -Folder $targetFolderUrl -ErrorAction Stop
+        if ($Overwrite) {
+            $file = Add-PnPFile -Path $SourcePath -Folder $targetFolderUrl -Overwrite -ErrorAction Stop
+        }
+        else {
+            $file = Add-PnPFile -Path $SourcePath -Folder $targetFolderUrl -ErrorAction Stop
+        }
         
         if ($file) {
             return @{ Success = $true; FileUrl = $file.ServerRelativeUrl; Error = $null }
@@ -269,8 +336,21 @@ function Copy-FileToSharePoint {
 # Main script
 Write-Host "`n=== ETL Clients Migration Script ===" -ForegroundColor Yellow
 Write-Host "Source: $sourcePath" -ForegroundColor Cyan
-Write-Host "Target: $($config.SharePointSiteUrl)/Documents/$targetSharePointBasePath/$targetRootFolderName" -ForegroundColor Cyan
+Write-Host "Target: $($config.SharePointSiteUrl) (Documents library) -> $targetSharePointBasePath/$targetRootFolderName" -ForegroundColor Cyan
+Write-Host "Log: $LogPath" -ForegroundColor Gray
 Write-Host ""
+
+Write-MigrationLog -Level "INFO" -Message "Starting migration run" -Data @{
+    SourcePath            = $sourcePath
+    SharePointSiteUrl     = $config.SharePointSiteUrl
+    TargetLibraryIdentity = "Documents"
+    TargetBasePath        = "$targetSharePointBasePath/$targetRootFolderName"
+    Migrate               = [bool]$Migrate
+    PreviewCount          = $PreviewCount
+    StopAfter             = $StopAfter
+    FailFast              = [bool]$FailFast
+    IncludeCanMigrate     = [bool]$IncludeCanMigrate
+}
 
 # Step 1: Scan source folder
 Write-Host "Step 1: Scanning source folder..." -ForegroundColor Cyan
@@ -285,6 +365,7 @@ Get-ChildItem -Path $sourcePath -Recurse -File -ErrorAction SilentlyContinue | F
     # Build SharePoint path: ETL/Clients/[relative path]
     # Only transform the root folder name, keep subfolders as-is
     $sharePointPath = "$targetSharePointBasePath\$targetRootFolderName\$relativePath"
+    $sharePointPath = Sanitize-LibraryRelativePath -Path $sharePointPath
     
     $files += @{
         FullPath = $_.FullName
@@ -301,6 +382,7 @@ Get-ChildItem -Path $sourcePath -Recurse -File -ErrorAction SilentlyContinue | F
 }
 
 Write-Host "Found $($files.Count) files to process" -ForegroundColor Green
+Write-MigrationLog -Level "INFO" -Message "Source scan complete" -Data @{ FileCount = $files.Count }
 
 # Step 2: Connect to SharePoint
 Write-Host "`nStep 2: Connecting to SharePoint..." -ForegroundColor Cyan
@@ -312,10 +394,24 @@ if (-not $spList) {
     throw "Could not find 'Documents' library in SharePoint"
 }
 
+# Print where we're actually writing (helps diagnose accidental "Shared Documents" folder creation)
+$libraryRootUrl = $spList.RootFolder.ServerRelativeUrl.TrimEnd('/')
+Write-Host "Documents library detected:" -ForegroundColor Gray
+Write-Host "  Title: $($spList.Title)" -ForegroundColor Gray
+Write-Host "  RootFolder.ServerRelativeUrl: $libraryRootUrl" -ForegroundColor Gray
+Write-Host "  Upload base (library-relative): $targetSharePointBasePath/$targetRootFolderName" -ForegroundColor Gray
+Write-MigrationLog -Level "INFO" -Message "Connected to Documents library" -Data @{
+    LibraryTitle  = $spList.Title
+    LibraryRootUrl = $libraryRootUrl
+    UploadBase     = "$targetSharePointBasePath/$targetRootFolderName"
+}
+
 # Step 3: Compare files (optional - check what exists)
 Write-Host "`nStep 3: Checking existing files in SharePoint..." -ForegroundColor Cyan
 $filesToMigrate = @()
 $existingCount = 0
+$canMigrateCount = 0
+$skippedNewerInSharePointCount = 0
 $checkCount = 0
 
 foreach ($file in $files) {
@@ -327,33 +423,92 @@ foreach ($file in $files) {
     
     $spPath = $file.SharePointPath -replace '\\', '/'
     $libraryRootUrl = $spList.RootFolder.ServerRelativeUrl.TrimEnd('/')
-    $libraryName = $spList.Title
-    
-    # If library is "Shared Documents", files are often under a "Documents" subfolder
-    if ($libraryName -eq "Shared Documents" -and $spPath -notmatch '^Documents/') {
-        $checkUrl = "$libraryRootUrl/Documents/$spPath"
-    }
-    else {
-        $checkUrl = "$libraryRootUrl/$spPath"
-    }
+    $checkUrl = "$libraryRootUrl/$spPath"
     
     try {
-        $existingFile = Get-PnPFile -Url $checkUrl -ErrorAction SilentlyContinue
-        if ($existingFile) {
+        # Use -AsListItem so we can compare Modified timestamps (supports "CanMigrate" logic)
+        $existingItem = Get-PnPFile -Url $checkUrl -AsListItem -ErrorAction SilentlyContinue
+
+        if ($existingItem) {
             $existingCount++
+
+            $spModified = $null
+            try { $spModified = [DateTime]$existingItem.FieldValues.Modified } catch { $spModified = $null }
+
+            if ($spModified -and $file.Modified -gt $spModified) {
+                # Newer on server => CanMigrate (overwrite) IF user opts in
+                $canMigrateCount++
+                if ($IncludeCanMigrate) {
+                    $fileToAdd = $file.Clone()
+                    $fileToAdd["Status"] = "CanMigrate"
+                    $fileToAdd["SharePointModified"] = $spModified
+                    $filesToMigrate += $fileToAdd
+                    if ($PreviewCount -gt 0 -and $filesToMigrate.Count -le $PreviewCount) {
+                        Write-Host ("  PLAN [{0}] (CanMigrate) {1} -> {2}" -f $filesToMigrate.Count, $file.RelativePath, $checkUrl) -ForegroundColor DarkCyan
+                        Write-MigrationLog -Level "PLAN" -Message "File can be migrated (newer on server)" -Data @{
+                            Status            = "CanMigrate"
+                            SourceFile        = $file.FullPath
+                            RelativePath      = $file.RelativePath
+                            TargetUrl         = $checkUrl
+                            ServerModified    = $file.Modified
+                            SharePointModified = $spModified
+                        }
+                    }
+                }
+            }
+            elseif ($spModified -and $spModified -gt $file.Modified) {
+                # Newer in SharePoint => skip to avoid overwriting
+                $skippedNewerInSharePointCount++
+            }
+            else {
+                # Same modified time (or couldn't read it) => treat as existing
+            }
         }
         else {
-            $filesToMigrate += $file
+            # Missing in SharePoint => migrate
+            $fileToAdd = $file.Clone()
+            $fileToAdd["Status"] = "Migrate"
+            $filesToMigrate += $fileToAdd
+            if ($PreviewCount -gt 0 -and $filesToMigrate.Count -le $PreviewCount) {
+                Write-Host ("  PLAN [{0}] (Migrate) {1} -> {2}" -f $filesToMigrate.Count, $file.RelativePath, $checkUrl) -ForegroundColor DarkCyan
+                Write-MigrationLog -Level "PLAN" -Message "File needs migration (missing)" -Data @{
+                    Status       = "Migrate"
+                    SourceFile   = $file.FullPath
+                    RelativePath = $file.RelativePath
+                    TargetUrl    = $checkUrl
+                }
+            }
         }
     }
     catch {
         # File doesn't exist, add to migration list
-        $filesToMigrate += $file
+        $fileToAdd = $file.Clone()
+        $fileToAdd["Status"] = "Migrate"
+        $filesToMigrate += $fileToAdd
+        if ($PreviewCount -gt 0 -and $filesToMigrate.Count -le $PreviewCount) {
+            Write-Host ("  PLAN [{0}] (Migrate) {1} -> {2}" -f $filesToMigrate.Count, $file.RelativePath, $checkUrl) -ForegroundColor DarkCyan
+            Write-MigrationLog -Level "PLAN" -Message "File needs migration (missing)" -Data @{
+                Status       = "Migrate"
+                SourceFile   = $file.FullPath
+                RelativePath = $file.RelativePath
+                TargetUrl    = $checkUrl
+            }
+        }
     }
 }
 
 Write-Host "Files already in SharePoint: $existingCount" -ForegroundColor Gray
+Write-Host "Files newer on server (CanMigrate): $canMigrateCount" -ForegroundColor Gray
+Write-Host "Skipped (newer in SharePoint): $skippedNewerInSharePointCount" -ForegroundColor Gray
 Write-Host "Files to migrate: $($filesToMigrate.Count)" -ForegroundColor Cyan
+Write-MigrationLog -Level "INFO" -Message "Plan computed" -Data @{
+    ExistingCount    = $existingCount
+    ToMigrateCount   = $filesToMigrate.Count
+    PreviewLogged    = [Math]::Min($PreviewCount, $filesToMigrate.Count)
+    CanMigrateCount  = $canMigrateCount
+    SkippedNewerInSharePointCount = $skippedNewerInSharePointCount
+    IncludeCanMigrate = [bool]$IncludeCanMigrate
+}
 
 # Step 4: Migrate files (if -Migrate is specified)
 if ($Migrate) {
@@ -366,6 +521,7 @@ if ($Migrate) {
         $migratedCount = 0
         $failedCount = 0
         $currentFile = 0
+        $attemptedCount = 0
         
         foreach ($file in $filesToMigrate) {
             $currentFile++
@@ -377,29 +533,69 @@ if ($Migrate) {
             # Flush output buffer to ensure message appears immediately
             [Console]::Out.Flush()
             
-            $result = Copy-FileToSharePoint -SourcePath $file.FullPath -SharePointPath $file.SharePointPath -List $spList
+            $attemptedCount++
+            $shouldOverwrite = ($file.Status -eq "CanMigrate")
+            Write-MigrationLog -Level "UPLOAD_START" -Message "Uploading file" -Data @{
+                Index        = $currentFile
+                Total        = $filesToMigrate.Count
+                SourceFile   = $file.FullPath
+                RelativePath = $file.RelativePath
+                SharePointPath = $file.SharePointPath
+                Status       = $file.Status
+                Overwrite    = [bool]$shouldOverwrite
+            }
+            $result = Copy-FileToSharePoint -SourcePath $file.FullPath -SharePointPath $file.SharePointPath -List $spList -Overwrite:$shouldOverwrite
             
             if ($result.Success) {
                 Write-Host "    ✓ Successfully uploaded" -ForegroundColor Green
                 $migratedCount++
+                Write-MigrationLog -Level "UPLOAD_OK" -Message "Upload succeeded" -Data @{
+                    Index        = $currentFile
+                    SourceFile   = $file.FullPath
+                    TargetUrl    = $result.FileUrl
+                }
             }
             else {
                 Write-Host "    ✗ Failed: $($result.Error)" -ForegroundColor Red
                 $failedCount++
+                Write-MigrationLog -Level "UPLOAD_FAIL" -Message "Upload failed" -Data @{
+                    Index      = $currentFile
+                    SourceFile = $file.FullPath
+                    Error      = $result.Error
+                }
+                if ($FailFast) {
+                    throw "FailFast: stopping on first upload failure: $($result.Error)"
+                }
             }
             
             # Flush after each file to ensure progress is visible
             [Console]::Out.Flush()
+
+            if ($StopAfter -gt 0 -and $attemptedCount -ge $StopAfter) {
+                Write-Host "StopAfter reached ($StopAfter upload attempts). Stopping early." -ForegroundColor Yellow
+                Write-MigrationLog -Level "WARN" -Message "StopAfter reached; stopping early" -Data @{
+                    StopAfter      = $StopAfter
+                    AttemptedCount = $attemptedCount
+                    MigratedCount  = $migratedCount
+                    FailedCount    = $failedCount
+                }
+                break
+            }
         }
         
         Write-Host "`n=== Migration Results ===" -ForegroundColor Yellow
         Write-Host "Successfully migrated: $migratedCount" -ForegroundColor Green
         Write-Host "Failed: $failedCount" -ForegroundColor Red
+        Write-MigrationLog -Level "INFO" -Message "Migration results" -Data @{
+            MigratedCount = $migratedCount
+            FailedCount   = $failedCount
+        }
     }
 }
 else {
     Write-Host "`nNote: Use -Migrate parameter to actually upload files" -ForegroundColor Yellow
     Write-Host "Example: .\Migrate-ETL-Clients.ps1 -ConfigPath config.json -Migrate" -ForegroundColor Gray
+    Write-Host ("Tip: run a tiny validation first: -Migrate -StopAfter 1 (or 5)") -ForegroundColor Gray
 }
 
 # Disconnect
