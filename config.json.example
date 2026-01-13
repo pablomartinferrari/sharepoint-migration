@@ -6,6 +6,7 @@
   "FileServerPath": "G:\\shared\\clients",
   "LibraryName": "Documents",
   "SharePointBasePath": null,
+  "FolderNameTransform": null,
   "StartDate": "2024-01-01",
   "EndDate": null
 }
@@ -17,6 +18,20 @@
 // - SharePoint Path (with SharePointBasePath: "etc"): etc\clients\client 1\my doc.pdf
 // The last folder name in FileServerPath ("clients") will be included in SharePoint paths
 // SharePointBasePath (optional): Adds a prefix folder in SharePoint (e.g., "etc" creates "etc\clients\...")
+//
+// FolderNameTransform (optional): Transform folder names during migration
+// Example: Simplify folder names by removing everything after the base name
+//   "FolderNameTransform": {
+//     "SimplifyFolders": true,
+//     "NameMappings": {
+//       "Clients": "clients"
+//     }
+//   }
+// - SimplifyFolders: If true, removes everything after " (" or " -" from folder names
+//   Example: "Clients (ETC - Wilco)" -> "Clients", "Projects - Old" -> "Projects"
+// - NameMappings: Object mapping exact folder names to new names (applied after simplification)
+//   Example: "Clients" -> "clients" (case normalization)
+// - RemovePattern: Optional regex pattern for custom removal (advanced use)
 
 // Date Filtering (optional):
 // - StartDate: Include files created/modified after this date (format: "YYYY-MM-DD" or "YYYY-MM-DD HH:MM:SS")

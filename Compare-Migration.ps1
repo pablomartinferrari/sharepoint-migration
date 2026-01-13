@@ -130,6 +130,81 @@ function Normalize-Path {
     return $normalized
 }
 
+# Helper function to transform folder names based on configuration
+function Transform-FolderName {
+    param(
+        [string]$FolderName,
+        [object]$TransformConfig
+    )
+    
+    if (-not $TransformConfig) {
+        return $FolderName
+    }
+    
+    $transformed = $FolderName
+    
+    # Apply name mappings first (if specified) - exact match replacements
+    if ($TransformConfig.NameMappings) {
+        foreach ($mapping in $TransformConfig.NameMappings.PSObject.Properties) {
+            if ($transformed -eq $mapping.Name) {
+                $transformed = $mapping.Value
+                break
+            }
+        }
+    }
+    
+    # Apply folder name simplification - keep only the base name before delimiters
+    # This handles cases like "Clients (ETC - Wilco)" -> "Clients"
+    if ($TransformConfig.SimplifyFolders) {
+        # Common delimiters that indicate additional info: space+paren, space+dash, just paren
+        # Remove everything after: " (", " -", "(", " -"
+        $simplified = $transformed -replace '\s*\(.*$', ''  # Remove " (anything)"
+        $simplified = $simplified -replace '\s+-.*$', ''    # Remove " - anything"
+        $simplified = $simplified.Trim()
+        if ($simplified) {
+            $transformed = $simplified
+        }
+    }
+    
+    # Apply regex pattern to remove parts (if specified)
+    if ($TransformConfig.RemovePattern) {
+        $transformed = $transformed -replace $TransformConfig.RemovePattern, ''
+    }
+    
+    # Trim any extra spaces that might result from pattern removal
+    $transformed = $transformed.Trim()
+    
+    return $transformed
+}
+
+# Helper function to transform a full path by transforming each folder name
+function Transform-Path {
+    param(
+        [string]$Path,
+        [object]$TransformConfig
+    )
+    
+    if (-not $TransformConfig) {
+        return $Path
+    }
+    
+    # Split path into parts
+    $pathParts = $Path -split '[\\/]'
+    $transformedParts = @()
+    
+    foreach ($part in $pathParts) {
+        if ($part) {
+            $transformedPart = Transform-FolderName -FolderName $part -TransformConfig $TransformConfig
+            if ($transformedPart) {
+                $transformedParts += $transformedPart
+            }
+        }
+    }
+    
+    # Rejoin with backslashes
+    return $transformedParts -join '\'
+}
+
 # Function to check if a specific file exists in SharePoint and return its metadata
 function Get-SharePointFile {
     param(
@@ -299,7 +374,8 @@ function Get-FileServerFiles {
         [string]$RootPath,
         [DateTime]$StartDate = $null,
         [DateTime]$EndDate = $null,
-        [string]$SharePointBasePath = $null  # Optional prefix path in SharePoint (e.g., "etc")
+        [string]$SharePointBasePath = $null,  # Optional prefix path in SharePoint (e.g., "etc")
+        [object]$FolderNameTransform = $null  # Optional folder name transformation config
     )
     
     Write-Host "Scanning file server: $RootPath..." -ForegroundColor Cyan
@@ -363,12 +439,23 @@ function Get-FileServerFiles {
             # File is locked - still report it but with limited info
             $relativePath = $fileInfo.FullName -replace [regex]::Escape($RootPath), ""
             $relativePath = $relativePath.TrimStart('\', '/')
-            # Create SharePoint path with optional base path
-            if ($SharePointBasePath) {
-                $sharePointRelativePath = "$SharePointBasePath\$rootFolderName\$relativePath"
+            
+            # Apply folder name transformations if configured
+            if ($FolderNameTransform) {
+                $transformedRootFolderName = Transform-FolderName -FolderName $rootFolderName -TransformConfig $FolderNameTransform
+                $transformedRelativePath = Transform-Path -Path $relativePath -TransformConfig $FolderNameTransform
             }
             else {
-                $sharePointRelativePath = "$rootFolderName\$relativePath"
+                $transformedRootFolderName = $rootFolderName
+                $transformedRelativePath = $relativePath
+            }
+            
+            # Create SharePoint path with optional base path
+            if ($SharePointBasePath) {
+                $sharePointRelativePath = "$SharePointBasePath\$transformedRootFolderName\$transformedRelativePath"
+            }
+            else {
+                $sharePointRelativePath = "$transformedRootFolderName\$transformedRelativePath"
             }
             $normalizedPath = Normalize-Path -Path $sharePointRelativePath
             
@@ -428,14 +515,26 @@ function Get-FileServerFiles {
         $relativePath = $fileInfo.FullName -replace [regex]::Escape($RootPath), ""
         $relativePath = $relativePath.TrimStart('\', '/')
         
-        # Create SharePoint path: [base path] + root folder name + relative path
+        # Apply folder name transformations if configured
+        if ($FolderNameTransform) {
+            # Transform the root folder name
+            $transformedRootFolderName = Transform-FolderName -FolderName $rootFolderName -TransformConfig $FolderNameTransform
+            # Transform the relative path (all folder names in the path)
+            $transformedRelativePath = Transform-Path -Path $relativePath -TransformConfig $FolderNameTransform
+        }
+        else {
+            $transformedRootFolderName = $rootFolderName
+            $transformedRelativePath = $relativePath
+        }
+        
+        # Create SharePoint path: [base path] + transformed root folder name + transformed relative path
         # If SharePointBasePath is specified (e.g., "etc"), path becomes "etc\clients\file.pdf"
         # Otherwise, just "clients\file.pdf"
         if ($SharePointBasePath) {
-            $sharePointRelativePath = "$SharePointBasePath\$rootFolderName\$relativePath"
+            $sharePointRelativePath = "$SharePointBasePath\$transformedRootFolderName\$transformedRelativePath"
         }
         else {
-            $sharePointRelativePath = "$rootFolderName\$relativePath"
+            $sharePointRelativePath = "$transformedRootFolderName\$transformedRelativePath"
         }
         
         # Normalize path for comparison (lowercase, backslashes)
@@ -490,7 +589,19 @@ Write-Host "Step 1: Scanning file server..." -ForegroundColor Cyan
 # Get optional SharePoint base path (prefix folder in SharePoint)
 $sharePointBasePath = if ($config.SharePointBasePath) { $config.SharePointBasePath } else { $null }
 
-$fileServerResult = Get-FileServerFiles -RootPath $config.FileServerPath -StartDate $startDate -EndDate $endDate -SharePointBasePath $sharePointBasePath
+# Get optional folder name transformation config
+$folderNameTransform = if ($config.FolderNameTransform) { $config.FolderNameTransform } else { $null }
+if ($folderNameTransform) {
+    Write-Host "Folder name transformation enabled:" -ForegroundColor Cyan
+    if ($folderNameTransform.RemovePattern) {
+        Write-Host "  Remove pattern: $($folderNameTransform.RemovePattern)" -ForegroundColor Gray
+    }
+    if ($folderNameTransform.NameMappings) {
+        Write-Host "  Name mappings configured: $($folderNameTransform.NameMappings.PSObject.Properties.Count) mappings" -ForegroundColor Gray
+    }
+}
+
+$fileServerResult = Get-FileServerFiles -RootPath $config.FileServerPath -StartDate $startDate -EndDate $endDate -SharePointBasePath $sharePointBasePath -FolderNameTransform $folderNameTransform
 $fileServerFiles = $fileServerResult.Files
 $lockedFiles = $fileServerResult.LockedFiles
 
@@ -723,8 +834,8 @@ Write-Host "Identical files: $identicalCount" -ForegroundColor Gray
 $results | Export-Csv -Path $ReportPath -NoTypeInformation
 Write-Host "`nReport saved to: $ReportPath" -ForegroundColor Green
 
-# Generate SPMT-compatible migration manifest (for files that need migration)
-$spmtManifestPath = $ReportPath -replace '\.csv$', '-spmt-manifest.csv'
+# Generate SPMT-compatible migration manifest in JSON format (for files that need migration)
+$spmtManifestPath = $ReportPath -replace '\.csv$', '-spmt-manifest.json'
 $spmtManifest = @()
 
 foreach ($result in $results) {
@@ -739,14 +850,15 @@ foreach ($result in $results) {
         }
         
         if ($fullPath) {
-            # SPMT format: SourcePath, TargetUrl, TargetDocumentLibrary
-            # Note: SPMT typically needs full paths and handles folder structure differently
-            # This is a simplified version - you may need to adjust based on your SPMT version
-            $spmtManifest += [PSCustomObject]@{
+            # Convert SharePoint path from backslashes to forward slashes for SPMT
+            $targetPath = $result.SharePointPath -replace '\\', '/'
+            
+            # SPMT JSON format: Array of objects with source and target information
+            $spmtManifest += @{
                 SourcePath = $fullPath
                 TargetUrl = $config.SharePointSiteUrl
                 TargetDocumentLibrary = $libraryName
-                TargetPath = $result.SharePointPath
+                TargetPath = $targetPath
                 FileName = Split-Path -Leaf $fullPath
             }
         }
@@ -754,9 +866,11 @@ foreach ($result in $results) {
 }
 
 if ($spmtManifest.Count -gt 0) {
-    $spmtManifest | Export-Csv -Path $spmtManifestPath -NoTypeInformation
-    Write-Host "SPMT migration manifest saved to: $spmtManifestPath ($($spmtManifest.Count) files)" -ForegroundColor Green
-    Write-Host "Note: SPMT CSV format may vary by version. Review and adjust if needed." -ForegroundColor Yellow
+    # Convert to JSON with proper formatting
+    $jsonContent = $spmtManifest | ConvertTo-Json -Depth 10
+    $jsonContent | Out-File -FilePath $spmtManifestPath -Encoding UTF8
+    Write-Host "SPMT migration manifest (JSON) saved to: $spmtManifestPath ($($spmtManifest.Count) files)" -ForegroundColor Green
+    Write-Host "Note: Review the JSON format and adjust if needed for your SPMT version." -ForegroundColor Yellow
 }
 else {
     Write-Host "No files to migrate - skipping SPMT manifest generation" -ForegroundColor Gray
