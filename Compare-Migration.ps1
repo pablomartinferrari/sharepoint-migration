@@ -31,7 +31,14 @@ param(
     # SharePoint + Windows timestamps can differ by milliseconds / timezone kind while printing the same in CSV.
     # Use a small tolerance to avoid false NewerOnServer/NewerInSharePoint classifications.
     [Parameter(Mandatory = $false)]
-    [double]$TimestampToleranceSeconds = 2
+    [double]$TimestampToleranceSeconds = 2,
+
+    # Optional date filter overrides (if not provided, config.StartDate/config.EndDate are used)
+    [Parameter(Mandatory = $false)]
+    [DateTime]$StartDate,
+
+    [Parameter(Mandatory = $false)]
+    [DateTime]$EndDate
 )
 
 # Error handling
@@ -71,22 +78,28 @@ if (-not (Test-Path $config.FileServerPath)) {
 }
 Write-Host "File server path is accessible: $($config.FileServerPath)" -ForegroundColor Green
 
-# Parse date filters (optional)
+# Parse date filters (optional). CLI parameters take precedence over config.
 $startDate = $null
 $endDate = $null
-if ($config.StartDate) {
+
+if ($PSBoundParameters.ContainsKey('StartDate')) {
+    $startDate = $StartDate
+}
+elseif ($config.StartDate) {
     try {
         $startDate = [DateTime]::Parse($config.StartDate)
-        Write-Host "Date filter: Including files created/modified after $($startDate.ToString('yyyy-MM-dd'))" -ForegroundColor Cyan
     }
     catch {
         throw "Invalid StartDate format in config. Use format like '2024-01-01' or '2024-01-01 00:00:00'"
     }
 }
-if ($config.EndDate) {
+
+if ($PSBoundParameters.ContainsKey('EndDate')) {
+    $endDate = $EndDate
+}
+elseif ($config.EndDate) {
     try {
         $endDate = [DateTime]::Parse($config.EndDate)
-        Write-Host "Date filter: Including files created/modified before $($endDate.ToString('yyyy-MM-dd'))" -ForegroundColor Cyan
     }
     catch {
         throw "Invalid EndDate format in config. Use format like '2024-12-31' or '2024-12-31 23:59:59'"
@@ -96,8 +109,17 @@ else {
     # Default end date to now if start date is specified
     if ($startDate) {
         $endDate = Get-Date
-        Write-Host "Date filter: End date not specified, using current date/time" -ForegroundColor Cyan
     }
+}
+
+if ($startDate) {
+    Write-Host "Date filter: Including files created/modified after $($startDate.ToString('yyyy-MM-dd'))" -ForegroundColor Cyan
+}
+if ($endDate) {
+    Write-Host "Date filter: Including files created/modified before $($endDate.ToString('yyyy-MM-dd'))" -ForegroundColor Cyan
+}
+if ($startDate -and -not $PSBoundParameters.ContainsKey('EndDate') -and -not $config.EndDate) {
+    Write-Host "Date filter: End date not specified, using current date/time" -ForegroundColor Cyan
 }
 
 # Function to connect to SharePoint using certificate authentication

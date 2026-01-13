@@ -109,6 +109,14 @@ $sourcePath = $SourcePath
 $targetSharePointBasePath = Sanitize-LibraryRelativePath -Path $SharePointBasePath
 $targetRootFolderName = "Clients"  # Always transform root folder to "Clients"
 
+# Date filters: if not explicitly provided, fall back to config values (safe + expected behavior)
+if (-not $PSBoundParameters.ContainsKey('StartDate') -and $config.StartDate) {
+    try { $StartDate = [DateTime]::Parse($config.StartDate) } catch { throw "Invalid StartDate format in config. Use format like '2024-01-01' or '2024-01-01 00:00:00'" }
+}
+if (-not $PSBoundParameters.ContainsKey('EndDate') -and $config.EndDate) {
+    try { $EndDate = [DateTime]::Parse($config.EndDate) } catch { throw "Invalid EndDate format in config. Use format like '2024-12-31' or '2024-12-31 23:59:59'" }
+}
+
 # Validate configuration
 $requiredFields = @('TenantId', 'ClientId', 'Thumbprint', 'SharePointSiteUrl')
 foreach ($field in $requiredFields) {
