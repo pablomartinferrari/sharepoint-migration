@@ -378,10 +378,16 @@ Get-ChildItem -Path $sourcePath -Recurse -File -ErrorAction SilentlyContinue | F
 
         if ($StartDate -and ($created -lt $StartDate) -and ($modified -lt $StartDate)) {
             $skippedByDateCount++
+            if ($fileCount % 1000 -eq 0) {
+                Write-Host "  Enumerated $fileCount files... kept $($files.Count), skipped by date $skippedByDateCount" -ForegroundColor Gray
+            }
             return
         }
         if ($EndDate -and ($created -gt $EndDate) -and ($modified -gt $EndDate)) {
             $skippedByDateCount++
+            if ($fileCount % 1000 -eq 0) {
+                Write-Host "  Enumerated $fileCount files... kept $($files.Count), skipped by date $skippedByDateCount" -ForegroundColor Gray
+            }
             return
         }
     }
@@ -403,8 +409,13 @@ Get-ChildItem -Path $sourcePath -Recurse -File -ErrorAction SilentlyContinue | F
         Modified = $_.LastWriteTime
     }
     
-    if ($files.Count % 1000 -eq 0) {
-        Write-Host "  Scanned $($files.Count) files..." -ForegroundColor Gray
+    if ($fileCount % 1000 -eq 0) {
+        if ($StartDate -or $EndDate) {
+            Write-Host "  Enumerated $fileCount files... kept $($files.Count), skipped by date $skippedByDateCount" -ForegroundColor Gray
+        }
+        else {
+            Write-Host "  Scanned $fileCount files..." -ForegroundColor Gray
+        }
     }
 }
 
