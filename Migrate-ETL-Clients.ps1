@@ -31,6 +31,11 @@ param(
     [Parameter(Mandatory = $false)]
     [DateTime]$EndDate,
 
+    # SharePoint + Windows timestamps can differ by milliseconds / timezone kind while printing the same.
+    # Use a small tolerance to avoid false CanMigrate/Skip decisions.
+    [Parameter(Mandatory = $false)]
+    [double]$TimestampToleranceSeconds = 2,
+
     # Safety: stop after N upload attempts (success or fail). 0 means no limit.
     [Parameter(Mandatory = $false)]
     [int]$StopAfter = 0,
@@ -357,6 +362,7 @@ Write-MigrationLog -Level "INFO" -Message "Starting migration run" -Data @{
     PreviewCount          = $PreviewCount
     StartDate             = if ($StartDate) { $StartDate.ToString("o") } else { $null }
     EndDate               = if ($EndDate) { $EndDate.ToString("o") } else { $null }
+    TimestampToleranceSeconds = $TimestampToleranceSeconds
     StopAfter             = $StopAfter
     FailFast              = [bool]$FailFast
     IncludeCanMigrate     = [bool]$IncludeCanMigrate
@@ -482,13 +488,19 @@ foreach ($file in $files) {
             $spModified = $null
             try { $spModified = [DateTime]$existingItem.FieldValues.Modified } catch { $spModified = $null }
 
-            if ($spModified -and $file.Modified -gt $spModified) {
+            $modifiedDeltaSeconds = $null
+            if ($spModified) {
+                $modifiedDeltaSeconds = ($file.Modified - $spModified).TotalSeconds
+            }
+
+            if ($spModified -and $modifiedDeltaSeconds -gt $TimestampToleranceSeconds) {
                 # Newer on server => CanMigrate (overwrite) IF user opts in
                 $canMigrateCount++
                 if ($IncludeCanMigrate) {
                     $fileToAdd = $file.Clone()
                     $fileToAdd["Status"] = "CanMigrate"
                     $fileToAdd["SharePointModified"] = $spModified
+                    $fileToAdd["ModifiedDeltaSeconds"] = [Math]::Round($modifiedDeltaSeconds, 3)
                     $filesToMigrate += $fileToAdd
                     if ($PreviewCount -gt 0 -and $filesToMigrate.Count -le $PreviewCount) {
                         Write-Host ("  PLAN [{0}] (CanMigrate) {1} -> {2}" -f $filesToMigrate.Count, $file.RelativePath, $checkUrl) -ForegroundColor DarkCyan
@@ -499,11 +511,13 @@ foreach ($file in $files) {
                             TargetUrl         = $checkUrl
                             ServerModified    = $file.Modified
                             SharePointModified = $spModified
+                            ModifiedDeltaSeconds = [Math]::Round($modifiedDeltaSeconds, 3)
+                            TimestampToleranceSeconds = $TimestampToleranceSeconds
                         }
                     }
                 }
             }
-            elseif ($spModified -and $spModified -gt $file.Modified) {
+            elseif ($spModified -and $modifiedDeltaSeconds -lt (-1 * $TimestampToleranceSeconds)) {
                 # Newer in SharePoint => skip to avoid overwriting
                 $skippedNewerInSharePointCount++
             }
