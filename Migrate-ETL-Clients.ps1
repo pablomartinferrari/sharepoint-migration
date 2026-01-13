@@ -152,7 +152,15 @@ function Ensure-SharePointFolder {
     
     $spFolderPath = $FolderPath -replace '\\', '/'
     $libraryRootUrl = $List.RootFolder.ServerRelativeUrl.TrimEnd('/')
-    $fullFolderPath = "$libraryRootUrl/$spFolderPath"
+    $libraryName = $List.Title
+    
+    # If library is "Shared Documents", folders are often under a "Documents" subfolder
+    if ($libraryName -eq "Shared Documents" -and $spFolderPath -notmatch '^Documents/') {
+        $fullFolderPath = "$libraryRootUrl/Documents/$spFolderPath"
+    }
+    else {
+        $fullFolderPath = "$libraryRootUrl/$spFolderPath"
+    }
     
     try {
         $folder = Get-PnPFolder -Url $fullFolderPath -ErrorAction Stop
@@ -162,8 +170,22 @@ function Ensure-SharePointFolder {
     }
     catch {
         # Folder doesn't exist, create it
+        # If library is "Shared Documents", we need to ensure "Documents" subfolder exists first
         $pathParts = $spFolderPath -split '/'
         $currentPath = $libraryRootUrl
+        
+        # If library is "Shared Documents", start with the "Documents" subfolder
+        if ($libraryName -eq "Shared Documents") {
+            $documentsPath = "$libraryRootUrl/Documents"
+            try {
+                $documentsFolder = Get-PnPFolder -Url $documentsPath -ErrorAction Stop
+                $currentPath = $documentsPath
+            }
+            catch {
+                # Documents subfolder doesn't exist, but we'll let it be created naturally as we traverse
+                # Just start from library root and it will be created if needed
+            }
+        }
         
         foreach ($part in $pathParts) {
             if ($part) {
@@ -215,7 +237,20 @@ function Copy-FileToSharePoint {
         }
         
         $libraryRootUrl = $List.RootFolder.ServerRelativeUrl.TrimEnd('/')
-        $targetFolderUrl = if ($folderPath) { "$libraryRootUrl/$folderPath" } else { $libraryRootUrl }
+        $libraryName = $List.Title
+        
+        # If library is "Shared Documents", folders are often under a "Documents" subfolder
+        if ($folderPath) {
+            if ($libraryName -eq "Shared Documents" -and $folderPath -notmatch '^Documents/') {
+                $targetFolderUrl = "$libraryRootUrl/Documents/$folderPath"
+            }
+            else {
+                $targetFolderUrl = "$libraryRootUrl/$folderPath"
+            }
+        }
+        else {
+            $targetFolderUrl = $libraryRootUrl
+        }
         
         $file = Add-PnPFile -Path $SourcePath -Folder $targetFolderUrl -ErrorAction Stop
         
@@ -292,7 +327,15 @@ foreach ($file in $files) {
     
     $spPath = $file.SharePointPath -replace '\\', '/'
     $libraryRootUrl = $spList.RootFolder.ServerRelativeUrl.TrimEnd('/')
-    $checkUrl = "$libraryRootUrl/$spPath"
+    $libraryName = $spList.Title
+    
+    # If library is "Shared Documents", files are often under a "Documents" subfolder
+    if ($libraryName -eq "Shared Documents" -and $spPath -notmatch '^Documents/') {
+        $checkUrl = "$libraryRootUrl/Documents/$spPath"
+    }
+    else {
+        $checkUrl = "$libraryRootUrl/$spPath"
+    }
     
     try {
         $existingFile = Get-PnPFile -Url $checkUrl -ErrorAction SilentlyContinue

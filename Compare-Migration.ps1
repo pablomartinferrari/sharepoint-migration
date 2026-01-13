@@ -303,8 +303,25 @@ function Get-SharePointFile {
     Write-Host "      SharePoint path: $spPath" -ForegroundColor DarkGray
     
     # Construct the full server-relative URL for the file
-    # SharePoint paths are typically: /sites/sitename/LibraryName/path/to/file.pdf
-    $fullServerRelativeUrl = "$libraryRootUrl/$spPath"
+    # The libraryRootUrl already includes the library name (e.g., /sites/ETCFiles/Documents or /sites/ETCFiles/Shared Documents)
+    # However, if the library is "Shared Documents" and files are actually under a "Documents" subfolder,
+    # we need to account for that. Try the most likely path first based on library name.
+    
+    # If library is "Shared Documents", files are often under a "Documents" subfolder
+    # So try: /sites/ETCFiles/Shared Documents/Documents/ETL/Clients/file.pdf
+    # Otherwise try: /sites/ETCFiles/Documents/ETL/Clients/file.pdf
+    if ($libraryName -eq "Shared Documents" -and $spPath -notmatch '^Documents/') {
+        $fullServerRelativeUrl = "$libraryRootUrl/Documents/$spPath"
+    }
+    else {
+        $fullServerRelativeUrl = "$libraryRootUrl/$spPath"
+    }
+    
+    # Remove any duplicate library names if they appear in the path
+    # Sometimes the path might already include "Documents" or "Shared Documents"
+    $fullServerRelativeUrl = $fullServerRelativeUrl -replace "/(Documents|Shared Documents)/(Documents|Shared Documents)/", '/$1/'
+    
+    Write-Host "      Primary URL: $fullServerRelativeUrl" -ForegroundColor DarkGray
     
     # Store the primary URL being checked for logging
     $primaryUrl = $fullServerRelativeUrl
@@ -350,13 +367,38 @@ function Get-SharePointFile {
         }
     }
     
-    # Alternative: Try with different library name prefixes
-    $possiblePaths = @(
-        "$libraryName/$spPath",
-        "Shared Documents/$spPath",
-        "Documents/$spPath",
-        $spPath
-    )
+    # Alternative: Try with different library name prefixes (only if initial path failed)
+    # The issue is that SharePoint might have nested structures like:
+    # - Library: "Shared Documents" -> Root: /sites/ETCFiles/Shared Documents
+    # - But files are actually at: /sites/ETCFiles/Shared Documents/Documents/ETL/Clients/...
+    # So we need to try adding "Documents" if the library is "Shared Documents"
+    
+    $libraryRootLower = $libraryRootUrl.ToLower()
+    $libraryNameLower = $libraryName.ToLower()
+    $rootEndsWithLibrary = $libraryRootLower.EndsWith("/$libraryNameLower") -or $libraryRootLower.EndsWith("/shared documents")
+    
+    $possiblePaths = @()
+    
+    # If library is "Shared Documents" and path doesn't start with "Documents", try adding it
+    # This handles the case where files are under Shared Documents/Documents/...
+    if ($libraryNameLower -eq "shared documents" -and $spPath -notmatch '^Documents/') {
+        $possiblePaths += "Documents/$spPath"
+    }
+    
+    # Only try other alternatives if the root doesn't already include the library name
+    if (-not $rootEndsWithLibrary) {
+        if ($spPath -notmatch '^Documents/') {
+            $possiblePaths += "Documents/$spPath"
+        }
+        if ($spPath -notmatch '^Shared Documents/') {
+            $possiblePaths += "Shared Documents/$spPath"
+        }
+        if ($spPath -notmatch "^$([regex]::Escape($libraryName))/") {
+            $possiblePaths += "$libraryName/$spPath"
+        }
+    }
+    # Always try the path as-is (without library prefix) as last resort
+    $possiblePaths += $spPath
     
     foreach ($testPath in $possiblePaths) {
         try {
@@ -568,13 +610,15 @@ function Copy-FileToSharePoint {
 }
 
 # Function to get all files from file server
+# Can optionally process files as they're found via ProcessFileCallback
 function Get-FileServerFiles {
     param(
         [string]$RootPath,
         [DateTime]$StartDate = $null,
         [DateTime]$EndDate = $null,
         [string]$SharePointBasePath = $null,  # Optional prefix path in SharePoint (e.g., "etc")
-        [object]$FolderNameTransform = $null  # Optional folder name transformation config
+        [object]$FolderNameTransform = $null,  # Optional folder name transformation config
+        [scriptblock]$ProcessFileCallback = $null  # Optional callback to process each file as it's found
     )
     
     Write-Host "Scanning file server: $RootPath..." -ForegroundColor Cyan
@@ -788,7 +832,7 @@ function Get-FileServerFiles {
             Write-Verbose "  Final SharePoint path: $sharePointRelativePath" -Verbose
         }
         
-        $files[$normalizedPath] = @{
+        $fileData = @{
             Name = $fileInfo.Name
             Size = $fileInfo.Length
             Modified = $fileInfo.LastWriteTime
@@ -798,6 +842,19 @@ function Get-FileServerFiles {
             NormalizedPath = $normalizedPath
             FullPath = $fileInfo.FullName
             IsLocked = $false
+        }
+        
+        # Store in dictionary for return value
+        $files[$normalizedPath] = $fileData
+        
+        # If callback provided, process file immediately
+        if ($ProcessFileCallback) {
+            try {
+                & $ProcessFileCallback -FileData $fileData
+            }
+            catch {
+                Write-Warning "Error processing file $($fileData.FullPath): $_"
+            }
         }
         
         if ($files.Count % 1000 -eq 0) {
@@ -832,8 +889,24 @@ function Get-FileServerFiles {
 Write-Host "`n=== Migration Comparison Tool ===" -ForegroundColor Yellow
 Write-Host ""
 
-# Step 1: Scan file server first (more efficient for large SharePoint sites)
-Write-Host "Step 1: Scanning file server..." -ForegroundColor Cyan
+# Step 1: Connect to SharePoint early (before scanning, so we can process files as we find them)
+Write-Host "Step 1: Connecting to SharePoint..." -ForegroundColor Cyan
+Connect-SharePoint -TenantId $config.TenantId -ClientId $config.ClientId -Thumbprint $config.Thumbprint -SiteUrl $config.SharePointSiteUrl
+
+# Get the SharePoint library/list (cache it for efficiency)
+$libraryName = if ($config.LibraryName) { $config.LibraryName } else { "Documents" }
+$spList = Get-PnPList -Identity $libraryName -ErrorAction SilentlyContinue
+if (-not $spList) {
+    $spList = Get-PnPList -Identity "Documents" -ErrorAction SilentlyContinue
+}
+if (-not $spList) {
+    throw "Could not find SharePoint library '$libraryName' or 'Documents'"
+}
+
+# Step 2: Scan file server and process files as they're found
+Write-Host "`nStep 2: Scanning file server and checking files in SharePoint (streaming mode)..." -ForegroundColor Cyan
+Write-Host "Note: Files will be checked and migrated as they're found (no need to wait for full scan)" -ForegroundColor Gray
+
 # Get optional SharePoint base path (prefix folder in SharePoint)
 $sharePointBasePath = if ($config.SharePointBasePath) { $config.SharePointBasePath } else { $null }
 
@@ -849,7 +922,127 @@ if ($folderNameTransform) {
     }
 }
 
-$fileServerResult = Get-FileServerFiles -RootPath $config.FileServerPath -StartDate $startDate -EndDate $endDate -SharePointBasePath $sharePointBasePath -FolderNameTransform $folderNameTransform
+# Initialize tracking variables for streaming processing
+$results = @()
+$missingCount = 0
+$newerOnServerCount = 0
+$newerInSharePointCount = 0
+$identicalCount = 0
+$checkedCount = 0
+$fileServerFiles = @{}
+$lockedFiles = @{}
+
+# Create callback to process each file as it's found
+$processFileCallback = {
+    param($FileData)
+    
+    $checkedCount++
+    $script:checkedCount = $checkedCount
+    
+    # Check if this specific file exists in SharePoint
+    $spFile = Get-SharePointFile -SiteUrl $config.SharePointSiteUrl -List $spList -SharePointPath $FileData.SharePointPath
+    
+    if ($spFile) {
+        # File exists in SharePoint - compare modification dates
+        if ($FileData.Modified -gt $spFile.Modified) {
+            # File is newer on server - can be migrated
+            $result = [PSCustomObject]@{
+                Status = "NewerOnServer"
+                FilePath = $FileData.NormalizedPath
+                SharePointPath = $FileData.SharePointPath
+                ServerSize = $FileData.Size
+                ServerModified = $FileData.Modified
+                SharePointSize = $spFile.Size
+                SharePointModified = $spFile.Modified
+                Action = "CanMigrate"
+            }
+            $script:results += $result
+            $script:newerOnServerCount++
+            
+            # If migrating, migrate immediately
+            if ($Migrate) {
+                Write-Host "  [$checkedCount] Migrating (newer on server): $($FileData.SharePointPath)" -ForegroundColor Cyan
+                $migrationResult = Copy-FileToSharePoint -SourcePath $FileData.FullPath -SharePointPath $FileData.SharePointPath -List $spList
+                if ($migrationResult.Success) {
+                    Write-Host "    ✓ Migrated successfully" -ForegroundColor Green
+                }
+                else {
+                    Write-Host "    ✗ Migration failed: $($migrationResult.Error)" -ForegroundColor Red
+                }
+            }
+        }
+        elseif ($spFile.Modified -gt $FileData.Modified) {
+            # File is newer in SharePoint - skip to avoid overwriting
+            $result = [PSCustomObject]@{
+                Status = "NewerInSharePoint"
+                FilePath = $FileData.NormalizedPath
+                SharePointPath = $FileData.SharePointPath
+                ServerSize = $FileData.Size
+                ServerModified = $FileData.Modified
+                SharePointSize = $spFile.Size
+                SharePointModified = $spFile.Modified
+                Action = "Skip"
+            }
+            $script:results += $result
+            $script:newerInSharePointCount++
+        }
+        else {
+            # Same modification time (or very close)
+            if ($FileData.Size -ne $spFile.Size) {
+                # Same time but different size - might need migration
+                $result = [PSCustomObject]@{
+                    Status = "SizeMismatch"
+                    FilePath = $FileData.NormalizedPath
+                    SharePointPath = $FileData.SharePointPath
+                    ServerSize = $FileData.Size
+                    ServerModified = $FileData.Modified
+                    SharePointSize = $spFile.Size
+                    SharePointModified = $spFile.Modified
+                    Action = "Review"
+                }
+                $script:results += $result
+            }
+            else {
+                $script:identicalCount++
+            }
+        }
+    }
+    else {
+        # File doesn't exist in SharePoint - needs migration
+        $result = [PSCustomObject]@{
+            Status = "Missing"
+            FilePath = $FileData.NormalizedPath
+            SharePointPath = $FileData.SharePointPath
+            ServerSize = $FileData.Size
+            ServerModified = $FileData.Modified
+            SharePointSize = $null
+            SharePointModified = $null
+            Action = "Migrate"
+        }
+        $script:results += $result
+        $script:missingCount++
+        
+        # If migrating, migrate immediately
+        if ($Migrate) {
+            Write-Host "  [$checkedCount] Migrating (missing): $($FileData.SharePointPath)" -ForegroundColor Cyan
+            $migrationResult = Copy-FileToSharePoint -SourcePath $FileData.FullPath -SharePointPath $FileData.SharePointPath -List $spList
+            if ($migrationResult.Success) {
+                Write-Host "    ✓ Migrated successfully" -ForegroundColor Green
+            }
+            else {
+                Write-Host "    ✗ Migration failed: $($migrationResult.Error)" -ForegroundColor Red
+            }
+        }
+    }
+    
+    # Progress update every 100 files
+    if ($checkedCount % 100 -eq 0) {
+        Write-Host "  Processed $checkedCount files (Missing: $script:missingCount, Newer: $script:newerOnServerCount, Identical: $script:identicalCount)..." -ForegroundColor Gray
+    }
+}
+
+# Scan file server with callback for streaming processing
+$fileServerResult = Get-FileServerFiles -RootPath $config.FileServerPath -StartDate $startDate -EndDate $endDate -SharePointBasePath $sharePointBasePath -FolderNameTransform $folderNameTransform -ProcessFileCallback $processFileCallback
 $fileServerFiles = $fileServerResult.Files
 $lockedFiles = $fileServerResult.LockedFiles
 
@@ -912,138 +1105,8 @@ if (-not $startDate -and -not $endDate) {
     Write-Host "  No date filter applied: All files included" -ForegroundColor Gray
 }
 
-# Step 2: Connect to SharePoint (only after file server scan is complete)
-Write-Host "`nStep 2: Connecting to SharePoint..." -ForegroundColor Cyan
-Connect-SharePoint -TenantId $config.TenantId -ClientId $config.ClientId -Thumbprint $config.Thumbprint -SiteUrl $config.SharePointSiteUrl
-
-# Get the SharePoint library/list (cache it for efficiency)
-$libraryName = if ($config.LibraryName) { $config.LibraryName } else { "Documents" }
-$spList = Get-PnPList -Identity $libraryName -ErrorAction SilentlyContinue
-if (-not $spList) {
-    $spList = Get-PnPList -Identity "Documents" -ErrorAction SilentlyContinue
-}
-if (-not $spList) {
-    throw "Could not find SharePoint library '$libraryName' or 'Documents'"
-}
-
-# Step 3: Compare files - check each file server file individually in SharePoint
-# Note: Using direct file access (Get-PnPFile -Url) which bypasses SharePoint's 5000 item limit
-# This approach queries files one at a time by direct URL, avoiding list view threshold issues
-Write-Host "`nStep 3: Comparing files (checking each file in SharePoint)..." -ForegroundColor Cyan
-Write-Host "Note: Using direct file access - bypasses SharePoint 5000 item limit per folder" -ForegroundColor Gray
-
-$results = @()
-$missingCount = 0
-$newerOnServerCount = 0
-$newerInSharePointCount = 0
-$identicalCount = 0
+# Add locked files to results (process them after scan completes)
 $lockedCount = $fileServerResult.LockedCount
-$checkedCount = 0
-$totalFiles = $fileServerFiles.Count
-
-foreach ($filePath in $fileServerFiles.Keys) {
-    $serverFile = $fileServerFiles[$filePath]
-    $checkedCount++
-    
-    # Get the library root URL for logging
-    $libraryRootUrl = $spList.RootFolder.ServerRelativeUrl.TrimEnd('/')
-    $spPathForUrl = $serverFile.SharePointPath -replace '\\', '/'
-    $checkUrl = "$libraryRootUrl/$spPathForUrl"
-    
-    # Log the file being checked
-    Write-Host "  [$checkedCount/$totalFiles] Checking: $($serverFile.SharePointPath)" -ForegroundColor DarkGray
-    Write-Host "    SharePoint URL: $checkUrl" -ForegroundColor DarkGray
-    
-    # Check if this specific file exists in SharePoint
-    # This uses Get-PnPFile -Url which directly accesses the file by URL,
-    # bypassing the 5000 item list view threshold
-    $spFile = Get-SharePointFile -SiteUrl $config.SharePointSiteUrl -List $spList -SharePointPath $serverFile.SharePointPath
-    
-    if ($spFile) {
-        $foundUrl = if ($spFile.CheckedUrl) { $spFile.CheckedUrl } else { $checkUrl }
-        Write-Host "    ✓ Found in SharePoint at: $foundUrl" -ForegroundColor Green
-        # File exists in SharePoint - compare modification dates
-        if ($serverFile.Modified -gt $spFile.Modified) {
-            # File is newer on server - can be migrated
-            $results += [PSCustomObject]@{
-                Status = "NewerOnServer"
-                FilePath = $filePath
-                SharePointPath = $serverFile.SharePointPath
-                ServerSize = $serverFile.Size
-                ServerModified = $serverFile.Modified
-                SharePointSize = $spFile.Size
-                SharePointModified = $spFile.Modified
-                Action = "CanMigrate"
-            }
-            $newerOnServerCount++
-        }
-        elseif ($spFile.Modified -gt $serverFile.Modified) {
-            # File is newer in SharePoint - skip to avoid overwriting
-            $results += [PSCustomObject]@{
-                Status = "NewerInSharePoint"
-                FilePath = $filePath
-                SharePointPath = $serverFile.SharePointPath
-                ServerSize = $serverFile.Size
-                ServerModified = $serverFile.Modified
-                SharePointSize = $spFile.Size
-                SharePointModified = $spFile.Modified
-                Action = "Skip"
-            }
-            $newerInSharePointCount++
-        }
-        else {
-            # Same modification time (or very close)
-            if ($serverFile.Size -ne $spFile.Size) {
-                # Same time but different size - might need migration
-                $results += [PSCustomObject]@{
-                    Status = "SizeMismatch"
-                    FilePath = $filePath
-                    SharePointPath = $serverFile.SharePointPath
-                    ServerSize = $serverFile.Size
-                    ServerModified = $serverFile.Modified
-                    SharePointSize = $spFile.Size
-                    SharePointModified = $spFile.Modified
-                    Action = "Review"
-                }
-            }
-            else {
-                $identicalCount++
-            }
-        }
-    }
-    else {
-        # File doesn't exist in SharePoint - needs migration
-        Write-Host "    ✗ Not found in SharePoint (will be migrated)" -ForegroundColor Yellow
-        $results += [PSCustomObject]@{
-            Status = "Missing"
-            FilePath = $filePath
-            SharePointPath = $serverFile.SharePointPath
-            ServerSize = $serverFile.Size
-            ServerModified = $serverFile.Modified
-            SharePointSize = $null
-            SharePointModified = $null
-            Action = "Migrate"
-        }
-        $missingCount++
-    }
-    
-    # Progress update every 100 files
-    if ($checkedCount % 100 -eq 0) {
-        $percentComplete = [Math]::Round(($checkedCount / $totalFiles) * 100, 1)
-        Write-Host "  Checked $checkedCount of $totalFiles files ($percentComplete%)..." -ForegroundColor Gray
-    }
-}
-
-# Show completion message if not already shown (when total is not a multiple of 100)
-if ($checkedCount % 100 -ne 0) {
-    $percentComplete = [Math]::Round(($checkedCount / $totalFiles) * 100, 1)
-    Write-Host "  Checked $checkedCount of $totalFiles files ($percentComplete%) - completed!" -ForegroundColor Gray
-}
-else {
-    Write-Host "  Completed checking all $totalFiles files!" -ForegroundColor Green
-}
-
-# Add locked files to results
 foreach ($filePath in $lockedFiles.Keys) {
     $lockedFile = $lockedFiles[$filePath]
     
@@ -1168,18 +1231,21 @@ Next Steps:
 $summary | Out-File -FilePath $summaryPath
 Write-Host "Summary saved to: $summaryPath" -ForegroundColor Green
 
-# Step 4: Migrate files if -Migrate parameter is specified
+# Step 3: Migration summary (files were migrated during scan if -Migrate was specified)
 if ($Migrate) {
-    Write-Host "`n=== Step 4: Migrating Files to SharePoint ===" -ForegroundColor Yellow
+    Write-Host "`n=== Migration Summary ===" -ForegroundColor Yellow
+    Write-Host "Files were migrated as they were found during the scan." -ForegroundColor Gray
+    Write-Host "Total files processed: $checkedCount" -ForegroundColor Cyan
+    Write-Host "Files migrated: $($missingCount + $newerOnServerCount)" -ForegroundColor Green
     
-    # Get files that need to be migrated
+    # Get files that were migrated
     $filesToMigrate = $results | Where-Object { $_.Action -eq "Migrate" -or $_.Action -eq "CanMigrate" }
     
     if ($filesToMigrate.Count -eq 0) {
-        Write-Host "No files to migrate. All files are either already in SharePoint or should be skipped." -ForegroundColor Gray
+        Write-Host "No files needed migration. All files are either already in SharePoint or should be skipped." -ForegroundColor Gray
     }
     else {
-        Write-Host "Found $($filesToMigrate.Count) files to migrate" -ForegroundColor Cyan
+        Write-Host "Files that needed migration: $($filesToMigrate.Count)" -ForegroundColor Cyan
         
         # Warn if there are a lot of files
         if ($filesToMigrate.Count -gt 10000) {
