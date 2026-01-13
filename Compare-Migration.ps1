@@ -23,7 +23,10 @@ param(
     [string]$ConfigPath,
     
     [Parameter(Mandatory = $false)]
-    [string]$ReportPath = $null
+    [string]$ReportPath = $null,
+    
+    [Parameter(Mandatory = $false)]
+    [switch]$Migrate  # If specified, will migrate files after comparison
 )
 
 # Error handling
@@ -55,6 +58,13 @@ foreach ($field in $requiredFields) {
         throw "Missing required configuration field: $field"
     }
 }
+
+# Early check: Verify file server path is accessible before proceeding
+Write-Host "Verifying file server path is accessible..." -ForegroundColor Cyan
+if (-not (Test-Path $config.FileServerPath)) {
+    throw "File server path is not accessible: $($config.FileServerPath). Please verify the path exists and you have access permissions."
+}
+Write-Host "File server path is accessible: $($config.FileServerPath)" -ForegroundColor Green
 
 # Parse date filters (optional)
 $startDate = $null
@@ -174,6 +184,12 @@ function Transform-FolderName {
     # Trim any extra spaces that might result from pattern removal
     $transformed = $transformed.Trim()
     
+    # Safety check: if transformation resulted in empty string, return original
+    if ([string]::IsNullOrWhiteSpace($transformed)) {
+        Write-Warning "Folder name transformation resulted in empty string for '$FolderName', using original name"
+        return $FolderName
+    }
+    
     return $transformed
 }
 
@@ -188,6 +204,10 @@ function Transform-Path {
         return $Path
     }
     
+    if ([string]::IsNullOrWhiteSpace($Path)) {
+        return $Path
+    }
+    
     # Split path into parts
     $pathParts = $Path -split '[\\/]'
     $transformedParts = @()
@@ -195,14 +215,28 @@ function Transform-Path {
     foreach ($part in $pathParts) {
         if ($part) {
             $transformedPart = Transform-FolderName -FolderName $part -TransformConfig $TransformConfig
-            if ($transformedPart) {
+            # Only add non-empty transformed parts
+            if ($transformedPart -and -not [string]::IsNullOrWhiteSpace($transformedPart)) {
                 $transformedParts += $transformedPart
+            }
+            else {
+                # If transformation resulted in empty, keep original to avoid breaking path
+                Write-Warning "Path part '$part' transformed to empty, keeping original"
+                $transformedParts += $part
             }
         }
     }
     
     # Rejoin with backslashes
-    return $transformedParts -join '\'
+    $result = $transformedParts -join '\'
+    
+    # Safety check: if result is empty, return original path
+    if ([string]::IsNullOrWhiteSpace($result)) {
+        Write-Warning "Path transformation resulted in empty path for '$Path', using original"
+        return $Path
+    }
+    
+    return $result
 }
 
 # Function to check if a specific file exists in SharePoint and return its metadata
@@ -368,6 +402,127 @@ function Get-SharePointFile {
     return $null
 }
 
+# Function to ensure a folder path exists in SharePoint
+function Ensure-SharePointFolder {
+    param(
+        [Microsoft.SharePoint.Client.List]$List,
+        [string]$FolderPath  # Relative path like "clients\client1" (with backslashes)
+    )
+    
+    if (-not $List -or -not $FolderPath) {
+        return $false
+    }
+    
+    # Convert backslashes to forward slashes for SharePoint
+    $spFolderPath = $FolderPath -replace '\\', '/'
+    
+    # Get library root
+    $libraryRootUrl = $List.RootFolder.ServerRelativeUrl.TrimEnd('/')
+    $fullFolderPath = "$libraryRootUrl/$spFolderPath"
+    
+    try {
+        # Try to get the folder - if it exists, we're done
+        $folder = Get-PnPFolder -Url $fullFolderPath -ErrorAction Stop
+        if ($folder) {
+            return $true
+        }
+    }
+    catch {
+        # Folder doesn't exist, need to create it
+        # Split path into parts and create each level
+        $pathParts = $spFolderPath -split '/'
+        $currentPath = $libraryRootUrl
+        
+        foreach ($part in $pathParts) {
+            if ($part) {
+                $currentPath = "$currentPath/$part"
+                try {
+                    # Try to get folder at this level
+                    $folder = Get-PnPFolder -Url $currentPath -ErrorAction Stop
+                }
+                catch {
+                    # Folder doesn't exist, create it
+                    try {
+                        $parentPath = $currentPath.Substring(0, $currentPath.LastIndexOf('/'))
+                        $folderName = $part
+                        Add-PnPFolder -Name $folderName -Folder $parentPath -ErrorAction Stop
+                        Write-Host "      Created folder: $currentPath" -ForegroundColor Gray
+                    }
+                    catch {
+                        Write-Host "      Warning: Failed to create folder $currentPath - $_" -ForegroundColor Yellow
+                        return $false
+                    }
+                }
+            }
+        }
+        return $true
+    }
+    
+    return $false
+}
+
+# Function to upload a file to SharePoint
+function Copy-FileToSharePoint {
+    param(
+        [string]$SourcePath,
+        [string]$SharePointPath,  # Relative path like "clients\client1\file.pdf"
+        [Microsoft.SharePoint.Client.List]$List,
+        [string]$LibraryName
+    )
+    
+    if (-not (Test-Path $SourcePath)) {
+        return @{
+            Success = $false
+            Error = "Source file not found: $SourcePath"
+        }
+    }
+    
+    try {
+        # Convert SharePoint path to forward slashes and get folder path
+        $spPath = $SharePointPath -replace '\\', '/'
+        $fileName = Split-Path -Leaf $spPath
+        $folderPath = $spPath.Substring(0, $spPath.LastIndexOf('/'))
+        
+        # Ensure folder exists
+        if ($folderPath) {
+            $folderCreated = Ensure-SharePointFolder -List $List -FolderPath ($folderPath -replace '/', '\')
+            if (-not $folderCreated) {
+                return @{
+                    Success = $false
+                    Error = "Failed to create folder structure: $folderPath"
+                }
+            }
+        }
+        
+        # Get library root
+        $libraryRootUrl = $List.RootFolder.ServerRelativeUrl.TrimEnd('/')
+        $targetFolderUrl = if ($folderPath) { "$libraryRootUrl/$folderPath" } else { $libraryRootUrl }
+        
+        # Upload the file
+        $file = Add-PnPFile -Path $SourcePath -Folder $targetFolderUrl -ErrorAction Stop
+        
+        if ($file) {
+            return @{
+                Success = $true
+                FileUrl = $file.ServerRelativeUrl
+                Error = $null
+            }
+        }
+        else {
+            return @{
+                Success = $false
+                Error = "Upload completed but file object not returned"
+            }
+        }
+    }
+    catch {
+        return @{
+            Success = $false
+            Error = $_.Exception.Message
+        }
+    }
+}
+
 # Function to get all files from file server
 function Get-FileServerFiles {
     param(
@@ -531,6 +686,16 @@ function Get-FileServerFiles {
             $transformedRootFolderName = Transform-FolderName -FolderName $rootFolderName -TransformConfig $FolderNameTransform
             # Transform the relative path (all folder names in the path)
             $transformedRelativePath = Transform-Path -Path $relativePath -TransformConfig $FolderNameTransform
+            
+            # Safety check: ensure we have valid folder names after transformation
+            if ([string]::IsNullOrWhiteSpace($transformedRootFolderName)) {
+                Write-Warning "Transformation resulted in empty root folder name for '$rootFolderName', using original"
+                $transformedRootFolderName = $rootFolderName
+            }
+            if ([string]::IsNullOrWhiteSpace($transformedRelativePath)) {
+                Write-Warning "Transformation resulted in empty relative path for '$relativePath', using original"
+                $transformedRelativePath = $relativePath
+            }
         }
         else {
             $transformedRootFolderName = $rootFolderName
@@ -547,8 +712,22 @@ function Get-FileServerFiles {
             $sharePointRelativePath = "$transformedRootFolderName\$transformedRelativePath"
         }
         
+        # Final safety check: ensure we have a valid SharePoint path
+        if ([string]::IsNullOrWhiteSpace($sharePointRelativePath)) {
+            Write-Warning "Skipping file due to empty SharePoint path: $($fileInfo.FullName)"
+            Write-Warning "  Original relative path: $relativePath"
+            Write-Warning "  Transformed root: $transformedRootFolderName"
+            Write-Warning "  Transformed relative: $transformedRelativePath"
+            return
+        }
+        
         # Normalize path for comparison (lowercase, backslashes)
         $normalizedPath = Normalize-Path -Path $sharePointRelativePath
+        
+        # Debug: Log first few files to verify they're being processed
+        if ($files.Count -lt 5) {
+            Write-Verbose "Processing file: $($fileInfo.Name) -> SharePoint: $sharePointRelativePath" -Verbose
+        }
         
         $files[$normalizedPath] = @{
             Name = $fileInfo.Name
@@ -915,9 +1094,112 @@ Next Steps:
 $summary | Out-File -FilePath $summaryPath
 Write-Host "Summary saved to: $summaryPath" -ForegroundColor Green
 
+# Step 4: Migrate files if -Migrate parameter is specified
+if ($Migrate) {
+    Write-Host "`n=== Step 4: Migrating Files to SharePoint ===" -ForegroundColor Yellow
+    
+    # Get files that need to be migrated
+    $filesToMigrate = $results | Where-Object { $_.Action -eq "Migrate" -or $_.Action -eq "CanMigrate" }
+    
+    if ($filesToMigrate.Count -eq 0) {
+        Write-Host "No files to migrate. All files are either already in SharePoint or should be skipped." -ForegroundColor Gray
+    }
+    else {
+        Write-Host "Found $($filesToMigrate.Count) files to migrate" -ForegroundColor Cyan
+        Write-Host ""
+        
+        $migrationResults = @()
+        $migratedCount = 0
+        $failedCount = 0
+        $skippedCount = 0
+        $currentFile = 0
+        
+        foreach ($fileToMigrate in $filesToMigrate) {
+            $currentFile++
+            $currentFilePercent = [Math]::Round(($currentFile / $filesToMigrate.Count) * 100, 1)
+            
+            # Find the full source path
+            $sourcePath = $null
+            foreach ($filePath in $fileServerFiles.Keys) {
+                if ($fileServerFiles[$filePath].NormalizedPath -eq $fileToMigrate.FilePath) {
+                    $sourcePath = $fileServerFiles[$filePath].FullPath
+                    break
+                }
+            }
+            
+            if (-not $sourcePath) {
+                Write-Host "  [$currentFile/$($filesToMigrate.Count)] ✗ Skipped: $($fileToMigrate.SharePointPath) - Source file not found" -ForegroundColor Yellow
+                $migrationResults += [PSCustomObject]@{
+                    SharePointPath = $fileToMigrate.SharePointPath
+                    SourcePath = $null
+                    Status = "Skipped"
+                    Error = "Source file not found"
+                }
+                $skippedCount++
+                continue
+            }
+            
+            # Check if file already exists (might have been uploaded by another process)
+            $existingFile = Get-SharePointFile -SiteUrl $config.SharePointSiteUrl -List $spList -SharePointPath $fileToMigrate.SharePointPath
+            if ($existingFile) {
+                Write-Host "  [$currentFile/$($filesToMigrate.Count)] ⊙ Skipped: $($fileToMigrate.SharePointPath) - Already exists in SharePoint" -ForegroundColor Gray
+                $migrationResults += [PSCustomObject]@{
+                    SharePointPath = $fileToMigrate.SharePointPath
+                    SourcePath = $sourcePath
+                    Status = "Skipped"
+                    Error = "File already exists in SharePoint"
+                }
+                $skippedCount++
+                continue
+            }
+            
+            Write-Host "  [$currentFile/$($filesToMigrate.Count)] ($currentFilePercent%) Uploading: $($fileToMigrate.SharePointPath)" -ForegroundColor Cyan
+            
+            # Upload the file
+            $uploadResult = Copy-FileToSharePoint -SourcePath $sourcePath -SharePointPath $fileToMigrate.SharePointPath -List $spList -LibraryName $libraryName
+            
+            if ($uploadResult.Success) {
+                Write-Host "    ✓ Successfully uploaded" -ForegroundColor Green
+                $migrationResults += [PSCustomObject]@{
+                    SharePointPath = $fileToMigrate.SharePointPath
+                    SourcePath = $sourcePath
+                    Status = "Success"
+                    FileUrl = $uploadResult.FileUrl
+                    Error = $null
+                }
+                $migratedCount++
+            }
+            else {
+                Write-Host "    ✗ Failed: $($uploadResult.Error)" -ForegroundColor Red
+                $migrationResults += [PSCustomObject]@{
+                    SharePointPath = $fileToMigrate.SharePointPath
+                    SourcePath = $sourcePath
+                    Status = "Failed"
+                    FileUrl = $null
+                    Error = $uploadResult.Error
+                }
+                $failedCount++
+            }
+        }
+        
+        # Generate migration report
+        $migrationReportPath = $ReportPath -replace '\.csv$', '-migration-results.csv'
+        $migrationResults | Export-Csv -Path $migrationReportPath -NoTypeInformation
+        Write-Host "`n=== Migration Results ===" -ForegroundColor Yellow
+        Write-Host "Total files processed: $($filesToMigrate.Count)" -ForegroundColor White
+        Write-Host "Successfully migrated: $migratedCount" -ForegroundColor Green
+        Write-Host "Failed: $failedCount" -ForegroundColor Red
+        Write-Host "Skipped: $skippedCount" -ForegroundColor Gray
+        Write-Host "`nMigration report saved to: $migrationReportPath" -ForegroundColor Green
+    }
+}
+
 # Disconnect from SharePoint
 if (Get-Module -Name PnP.PowerShell) {
     Disconnect-PnPOnline
 }
 
 Write-Host "`nComparison complete!" -ForegroundColor Green
+if ($Migrate) {
+    Write-Host "Migration complete!" -ForegroundColor Green
+}
