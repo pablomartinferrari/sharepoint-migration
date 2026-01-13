@@ -114,8 +114,25 @@ function Connect-SharePoint {
     
     Import-Module PnP.PowerShell -ErrorAction Stop
     
+    # First, verify the certificate exists
+    Write-Host "Checking for certificate with thumbprint: $Thumbprint..." -ForegroundColor Gray
+    $cert = Get-ChildItem -Path Cert:\CurrentUser\My | Where-Object { $_.Thumbprint -eq $Thumbprint }
+    if (-not $cert) {
+        $cert = Get-ChildItem -Path Cert:\LocalMachine\My | Where-Object { $_.Thumbprint -eq $Thumbprint }
+    }
+    
+    if (-not $cert) {
+        throw "Certificate with thumbprint '$Thumbprint' not found in certificate store. Please verify:" + 
+              "`n  1. The certificate is installed in either CurrentUser\My or LocalMachine\My" + 
+              "`n  2. The thumbprint in config.json matches exactly (case-sensitive)" + 
+              "`n  3. You have access to the certificate's private key"
+    }
+    
+    Write-Host "Certificate found: $($cert.Subject) (Valid until: $($cert.NotAfter))" -ForegroundColor Gray
+    
     try {
         # Connect using certificate authentication (matching existing pattern)
+        Write-Host "Connecting to SharePoint site..." -ForegroundColor Gray
         Connect-PnPOnline -Url $SiteUrl -ClientId $ClientId -Thumbprint $Thumbprint -Tenant $TenantId -WarningAction SilentlyContinue -ErrorAction Stop
         
         # Verify connection
@@ -124,7 +141,19 @@ function Connect-SharePoint {
         return $true
     }
     catch {
-        throw "Failed to connect with PnP.PowerShell: $_"
+        $errorDetails = $_.Exception.Message
+        if ($errorDetails -like "*keyset*" -or $errorDetails -like "*key*") {
+            throw "Failed to connect: Certificate access error. The certificate exists but the private key may not be accessible. " +
+                  "`nError details: $errorDetails" +
+                  "`n`nTroubleshooting:" +
+                  "`n  1. Ensure you have permission to access the certificate's private key" +
+                  "`n  2. If using a service account, ensure it has access to the certificate" +
+                  "`n  3. Try running PowerShell as Administrator" +
+                  "`n  4. Verify the certificate hasn't expired"
+        }
+        else {
+            throw "Failed to connect with PnP.PowerShell: $errorDetails"
+        }
     }
 }
 
@@ -147,11 +176,22 @@ function Transform-FolderName {
         [object]$TransformConfig
     )
     
-    if (-not $TransformConfig) {
-        return $FolderName
+    $transformed = $FolderName
+    
+    # Hardcoded replacement: "Clients" followed by anything -> "Clients"
+    # This handles "Clients (ETC - Wilco)", "Clients - Old", "Clients(anything)", etc.
+    # This always runs, regardless of TransformConfig
+    if ($transformed -match '^Clients') {
+        # If it's exactly "Clients", keep it; otherwise replace with just "Clients"
+        if ($transformed -ne 'Clients') {
+            $transformed = 'Clients'
+        }
     }
     
-    $transformed = $FolderName
+    # If no TransformConfig, return after hardcoded replacement
+    if (-not $TransformConfig) {
+        return $transformed
+    }
     
     # Apply name mappings first (if specified) - exact match replacements
     if ($TransformConfig.NameMappings) {
@@ -200,10 +240,6 @@ function Transform-Path {
         [object]$TransformConfig
     )
     
-    if (-not $TransformConfig) {
-        return $Path
-    }
-    
     if ([string]::IsNullOrWhiteSpace($Path)) {
         return $Path
     }
@@ -214,6 +250,8 @@ function Transform-Path {
     
     foreach ($part in $pathParts) {
         if ($part) {
+            # Transform-FolderName now always applies hardcoded "Clients" transformation
+            # even if TransformConfig is null
             $transformedPart = Transform-FolderName -FolderName $part -TransformConfig $TransformConfig
             # Only add non-empty transformed parts
             if ($transformedPart -and -not [string]::IsNullOrWhiteSpace($transformedPart)) {
@@ -559,10 +597,16 @@ function Get-FileServerFiles {
     
     # Show the correct SharePoint path mapping including SharePointBasePath if provided
     if ($SharePointBasePath) {
-        Write-Host "  Files will be mapped to SharePoint path: $SharePointBasePath\$transformedRootFolderName\<relative path>" -ForegroundColor Gray
+        Write-Host "  Files will be mapped to SharePoint path: $SharePointBasePath\$transformedRootFolderName\[relative path]" -ForegroundColor Gray
+        Write-Host "    Example: $SharePointBasePath\$transformedRootFolderName\subfolder\file.pdf" -ForegroundColor DarkGray
     }
     else {
-        Write-Host "  Files will be mapped to SharePoint path: $transformedRootFolderName\<relative path>" -ForegroundColor Gray
+        Write-Host "  Files will be mapped to SharePoint path: $transformedRootFolderName\[relative path]" -ForegroundColor Gray
+        Write-Host "    Example: $transformedRootFolderName\subfolder\file.pdf" -ForegroundColor DarkGray
+    }
+    
+    if ($FolderNameTransform) {
+        Write-Host "  Note: Folder name transformations are applied to all paths" -ForegroundColor DarkGray
     }
     
     $files = @{}
@@ -687,6 +731,12 @@ function Get-FileServerFiles {
             # Transform the relative path (all folder names in the path)
             $transformedRelativePath = Transform-Path -Path $relativePath -TransformConfig $FolderNameTransform
             
+            # Debug: Show transformation for first few files
+            if ($files.Count -lt 3) {
+                Write-Host "  DEBUG: Root '$rootFolderName' -> '$transformedRootFolderName'" -ForegroundColor Cyan
+                Write-Host "  DEBUG: Relative '$relativePath' -> '$transformedRelativePath'" -ForegroundColor Cyan
+            }
+            
             # Safety check: ensure we have valid folder names after transformation
             if ([string]::IsNullOrWhiteSpace($transformedRootFolderName)) {
                 Write-Warning "Transformation resulted in empty root folder name for '$rootFolderName', using original"
@@ -726,7 +776,10 @@ function Get-FileServerFiles {
         
         # Debug: Log first few files to verify they're being processed
         if ($files.Count -lt 5) {
-            Write-Verbose "Processing file: $($fileInfo.Name) -> SharePoint: $sharePointRelativePath" -Verbose
+            Write-Verbose "Processing file: $($fileInfo.Name)" -Verbose
+            Write-Verbose "  Original relative path: $relativePath" -Verbose
+            Write-Verbose "  Transformed relative path: $transformedRelativePath" -Verbose
+            Write-Verbose "  Final SharePoint path: $sharePointRelativePath" -Verbose
         }
         
         $files[$normalizedPath] = @{
