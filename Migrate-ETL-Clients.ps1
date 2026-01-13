@@ -43,6 +43,37 @@ param(
 # Error handling
 $ErrorActionPreference = "Stop"
 
+# Function to sanitize a library-relative path (do not allow "Documents"/"Shared Documents" prefixes)
+function Sanitize-LibraryRelativePath {
+    param([string]$Path)
+
+    if (-not $Path) {
+        return $Path
+    }
+
+    $p = $Path.Trim()
+    $p = $p -replace '\\', '/'
+    $p = $p.Trim('/')
+
+    if (-not $p) {
+        return $p
+    }
+
+    $parts = $p -split '/'
+    $filtered = @()
+    foreach ($part in $parts) {
+        if (-not $part) { continue }
+        $filtered += $part
+    }
+
+    # If someone accidentally included the library name in the "base path", remove it.
+    while ($filtered.Count -gt 0 -and ($filtered[0] -ieq 'documents' -or $filtered[0] -ieq 'shared documents')) {
+        $filtered = $filtered[1..($filtered.Count - 1)]
+    }
+
+    return ($filtered -join '/')
+}
+
 # Ensure we have a log path early
 if (-not $LogPath) {
     $LogPath = Join-Path -Path "." -ChildPath ("logs\etl-clients-migration-{0}.jsonl" -f (Get-Date -Format "yyyyMMdd-HHmmss"))
@@ -174,37 +205,6 @@ function Normalize-Path {
     $normalized = $normalized -replace '/', '\'
     $normalized = $normalized.TrimStart('\')
     return $normalized
-}
-
-# Function to sanitize a library-relative path (do not allow "Documents"/"Shared Documents" prefixes)
-function Sanitize-LibraryRelativePath {
-    param([string]$Path)
-
-    if (-not $Path) {
-        return $Path
-    }
-
-    $p = $Path.Trim()
-    $p = $p -replace '\\', '/'
-    $p = $p.Trim('/')
-
-    if (-not $p) {
-        return $p
-    }
-
-    $parts = $p -split '/'
-    $filtered = @()
-    foreach ($part in $parts) {
-        if (-not $part) { continue }
-        $filtered += $part
-    }
-
-    # If someone accidentally included the library name in the "base path", remove it.
-    while ($filtered.Count -gt 0 -and ($filtered[0] -ieq 'documents' -or $filtered[0] -ieq 'shared documents')) {
-        $filtered = $filtered[1..($filtered.Count - 1)]
-    }
-
-    return ($filtered -join '/')
 }
 
 # Structured logger (JSONL). Safe for long runs and easy to tail/grep.
