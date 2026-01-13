@@ -1,0 +1,10 @@
+# VS/VSCode local workspace files
+.vs/
+.vscode/
+
+# Visual Studio user-specific files
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+
