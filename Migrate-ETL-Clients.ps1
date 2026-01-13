@@ -43,6 +43,51 @@ if (-not (Test-Path $sourcePath)) {
 }
 Write-Host "Source path is accessible: $sourcePath" -ForegroundColor Green
 
+# Early check: Verify SharePoint connection and access
+Write-Host "Verifying SharePoint connection..." -ForegroundColor Cyan
+try {
+    # Check if PnP.PowerShell is available
+    if (-not (Get-Module -ListAvailable -Name PnP.PowerShell)) {
+        Write-Host "PnP.PowerShell module not found. Installing..." -ForegroundColor Yellow
+        Install-Module PnP.PowerShell -Scope CurrentUser -Force -AllowClobber
+    }
+    Import-Module PnP.PowerShell -ErrorAction Stop
+    
+    # Verify certificate exists
+    Write-Host "Checking for certificate..." -ForegroundColor Gray
+    $cert = Get-ChildItem -Path Cert:\CurrentUser\My | Where-Object { $_.Thumbprint -eq $config.Thumbprint }
+    if (-not $cert) {
+        $cert = Get-ChildItem -Path Cert:\LocalMachine\My | Where-Object { $_.Thumbprint -eq $config.Thumbprint }
+    }
+    if (-not $cert) {
+        throw "Certificate with thumbprint '$($config.Thumbprint)' not found in certificate store."
+    }
+    
+    # Test connection to SharePoint
+    Connect-PnPOnline -Url $config.SharePointSiteUrl -ClientId $config.ClientId -Thumbprint $config.Thumbprint -Tenant $config.TenantId -WarningAction SilentlyContinue -ErrorAction Stop
+    
+    # Verify we can access the Documents library
+    $testList = Get-PnPList -Identity "Documents" -ErrorAction Stop
+    if (-not $testList) {
+        throw "Could not access 'Documents' library in SharePoint. Please verify permissions."
+    }
+    
+    # Test reading a file/folder to ensure we have proper access
+    $testFolder = Get-PnPFolder -Url $testList.RootFolder.ServerRelativeUrl -ErrorAction Stop
+    if (-not $testFolder) {
+        throw "Could not access SharePoint root folder. Please verify permissions."
+    }
+    
+    Write-Host "SharePoint connection verified: $($config.SharePointSiteUrl)" -ForegroundColor Green
+    Write-Host "  Documents library accessible" -ForegroundColor Gray
+    
+    # Disconnect for now (will reconnect later)
+    Disconnect-PnPOnline -ErrorAction SilentlyContinue
+}
+catch {
+    throw "Failed to verify SharePoint access: $_`nPlease check your SharePoint site URL, certificate, and permissions."
+}
+
 # Function to connect to SharePoint
 function Connect-SharePoint {
     param(

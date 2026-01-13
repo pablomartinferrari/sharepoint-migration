@@ -536,7 +536,13 @@ function Copy-FileToSharePoint {
         $libraryRootUrl = $List.RootFolder.ServerRelativeUrl.TrimEnd('/')
         $targetFolderUrl = if ($folderPath) { "$libraryRootUrl/$folderPath" } else { $libraryRootUrl }
         
-        # Upload the file
+        # Show file size for context
+        $fileSize = (Get-Item $SourcePath).Length
+        $fileSizeMB = [Math]::Round($fileSize / 1MB, 2)
+        Write-Host "      File size: $fileSizeMB MB - Uploading to SharePoint..." -ForegroundColor DarkGray
+        [Console]::Out.Flush()
+        
+        # Upload the file (this can take time for larger files)
         $file = Add-PnPFile -Path $SourcePath -Folder $targetFolderUrl -ErrorAction Stop
         
         if ($file) {
@@ -1073,8 +1079,23 @@ Write-Host "Files newer in SharePoint (will skip): $newerInSharePointCount" -For
 Write-Host "Identical files: $identicalCount" -ForegroundColor Gray
 
 # Export report
-$results | Export-Csv -Path $ReportPath -NoTypeInformation
-Write-Host "`nReport saved to: $ReportPath" -ForegroundColor Green
+try {
+    $results | Export-Csv -Path $ReportPath -NoTypeInformation -ErrorAction Stop
+    
+    # Excel row limit is 1,048,576 rows (Excel 2007+)
+    $excelRowLimit = 1048576
+    if ($results.Count -gt $excelRowLimit) {
+        Write-Host "`n⚠️  WARNING: Report has $($results.Count) records, which exceeds Excel's limit of $excelRowLimit rows" -ForegroundColor Yellow
+        Write-Host "The CSV file was generated successfully, but Excel will only display the first $excelRowLimit rows." -ForegroundColor Yellow
+        Write-Host "Consider using a different tool (like Power BI, or split the report) to view all records." -ForegroundColor Yellow
+    }
+    
+    Write-Host "`nReport saved to: $ReportPath ($($results.Count) records)" -ForegroundColor Green
+}
+catch {
+    Write-Host "`nWarning: Failed to generate comparison report CSV: $_" -ForegroundColor Yellow
+    Write-Host "Comparison completed, but report generation failed. Results are still available in memory." -ForegroundColor Yellow
+}
 
 # Generate SPMT-compatible migration manifest in JSON format (for files that need migration)
 $spmtManifestPath = $ReportPath -replace '\.csv$', '-spmt-manifest.json'
@@ -1159,6 +1180,23 @@ if ($Migrate) {
     }
     else {
         Write-Host "Found $($filesToMigrate.Count) files to migrate" -ForegroundColor Cyan
+        
+        # Warn if there are a lot of files
+        if ($filesToMigrate.Count -gt 10000) {
+            Write-Host "`n⚠️  WARNING: Large migration detected ($($filesToMigrate.Count) files)" -ForegroundColor Yellow
+            Write-Host "This migration may take a very long time and could hit SharePoint rate limits." -ForegroundColor Yellow
+            Write-Host "Estimated time: ~$([Math]::Round($filesToMigrate.Count * 2 / 60, 0)) minutes (assuming 2 seconds per file)" -ForegroundColor Yellow
+            Write-Host ""
+            $confirm = Read-Host "Do you want to continue? (Y/N)"
+            if ($confirm -ne 'Y' -and $confirm -ne 'y') {
+                Write-Host "Migration cancelled by user." -ForegroundColor Gray
+                exit 0
+            }
+        }
+        elseif ($filesToMigrate.Count -gt 1000) {
+            Write-Host "Note: Large migration ($($filesToMigrate.Count) files) - this may take some time" -ForegroundColor Yellow
+        }
+        
         Write-Host ""
         
         $migrationResults = @()
@@ -1206,7 +1244,10 @@ if ($Migrate) {
                 continue
             }
             
-            Write-Host "  [$currentFile/$($filesToMigrate.Count)] ($currentFilePercent%) Uploading: $($fileToMigrate.SharePointPath)" -ForegroundColor Cyan
+            $fileSizeMB = [Math]::Round((Get-Item $sourcePath).Length / 1MB, 2)
+            Write-Host "  [$currentFile/$($filesToMigrate.Count)] ($currentFilePercent%) Uploading: $($fileToMigrate.SharePointPath) ($fileSizeMB MB)" -ForegroundColor Cyan
+            Write-Host "    Starting upload..." -ForegroundColor Gray
+            [Console]::Out.Flush()
             
             # Upload the file
             $uploadResult = Copy-FileToSharePoint -SourcePath $sourcePath -SharePointPath $fileToMigrate.SharePointPath -List $spList -LibraryName $libraryName
@@ -1237,13 +1278,20 @@ if ($Migrate) {
         
         # Generate migration report
         $migrationReportPath = $ReportPath -replace '\.csv$', '-migration-results.csv'
-        $migrationResults | Export-Csv -Path $migrationReportPath -NoTypeInformation
-        Write-Host "`n=== Migration Results ===" -ForegroundColor Yellow
-        Write-Host "Total files processed: $($filesToMigrate.Count)" -ForegroundColor White
-        Write-Host "Successfully migrated: $migratedCount" -ForegroundColor Green
-        Write-Host "Failed: $failedCount" -ForegroundColor Red
-        Write-Host "Skipped: $skippedCount" -ForegroundColor Gray
-        Write-Host "`nMigration report saved to: $migrationReportPath" -ForegroundColor Green
+        try {
+            $migrationResults | Export-Csv -Path $migrationReportPath -NoTypeInformation -ErrorAction Stop
+            Write-Host "`n=== Migration Results ===" -ForegroundColor Yellow
+            Write-Host "Total files processed: $($filesToMigrate.Count)" -ForegroundColor White
+            Write-Host "Successfully migrated: $migratedCount" -ForegroundColor Green
+            Write-Host "Failed: $failedCount" -ForegroundColor Red
+            Write-Host "Skipped: $skippedCount" -ForegroundColor Gray
+            Write-Host "`nMigration report saved to: $migrationReportPath ($($migrationResults.Count) records)" -ForegroundColor Green
+        }
+        catch {
+            Write-Host "`nWarning: Failed to generate migration report CSV: $_" -ForegroundColor Yellow
+            Write-Host "Migration completed successfully, but report generation failed." -ForegroundColor Yellow
+            Write-Host "Summary: $migratedCount migrated, $failedCount failed, $skippedCount skipped" -ForegroundColor Gray
+        }
     }
 }
 
