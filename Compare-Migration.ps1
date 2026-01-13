@@ -884,8 +884,13 @@ function Get-FileServerFiles {
             }
         }
         
-        if ($files.Count % 1000 -eq 0) {
-            Write-Host "  Processed $($files.Count) files (scanned $fileCount total)..." -ForegroundColor Gray
+        if ($fileCount % 1000 -eq 0) {
+            if ($StartDate -or $EndDate) {
+                Write-Host "  Enumerated $fileCount files... kept $($files.Count), filtered by date $filteredCount, locked $lockedCount" -ForegroundColor Gray
+            }
+            else {
+                Write-Host "  Scanned $fileCount files... kept $($files.Count), locked $lockedCount" -ForegroundColor Gray
+            }
         }
     }
     
@@ -894,6 +899,8 @@ function Get-FileServerFiles {
         Files = $files
         LockedFiles = $lockedFiles
         LockedCount = $lockedCount
+        TotalEnumerated = $fileCount
+        FilteredByDate = $filteredCount
     }
     
     $statusMsg = "Found $($files.Count) files on file server"
@@ -901,7 +908,7 @@ function Get-FileServerFiles {
         $statusMsg += ", $lockedCount locked/inaccessible files"
     }
     if ($StartDate -or $EndDate) {
-        $statusMsg += " (filtered $filteredCount files by date)"
+        $statusMsg += " (enumerated $fileCount; filtered by date $filteredCount)"
     }
     Write-Host $statusMsg -ForegroundColor Green
     
@@ -1077,6 +1084,8 @@ $processFileCallback = {
 $fileServerResult = Get-FileServerFiles -RootPath $config.FileServerPath -StartDate $startDate -EndDate $endDate -SharePointBasePath $sharePointBasePath -FolderNameTransform $folderNameTransform -ProcessFileCallback $processFileCallback
 $fileServerFiles = $fileServerResult.Files
 $lockedFiles = $fileServerResult.LockedFiles
+$filteredByDate = if ($fileServerResult.FilteredByDate) { [int]$fileServerResult.FilteredByDate } else { 0 }
+$totalEnumerated = if ($fileServerResult.TotalEnumerated) { [int]$fileServerResult.TotalEnumerated } else { $fileServerFiles.Count }
 
 # Generate file server scan report (before SharePoint comparison)
 # This report lists all files found during the scan, useful for tracking what will be compared
@@ -1126,6 +1135,10 @@ Write-Host "File server scan report saved to: $fileServerReportPath" -Foreground
 Write-Host "  Total files found: $($fileServerFiles.Count)" -ForegroundColor Gray
 if ($lockedFiles.Count -gt 0) {
     Write-Host "  Locked/inaccessible files: $($lockedFiles.Count)" -ForegroundColor Yellow
+}
+if ($startDate -or $endDate) {
+    Write-Host "  Total files enumerated: $totalEnumerated" -ForegroundColor Gray
+    Write-Host "  Filtered out by date: $filteredByDate" -ForegroundColor Gray
 }
 if ($startDate) {
     Write-Host "  Date filter applied: Files created/modified after $($startDate.ToString('yyyy-MM-dd HH:mm:ss'))" -ForegroundColor Gray
