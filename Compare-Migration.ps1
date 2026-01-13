@@ -219,7 +219,8 @@ function Get-FileServerFiles {
     param(
         [string]$RootPath,
         [DateTime]$StartDate = $null,
-        [DateTime]$EndDate = $null
+        [DateTime]$EndDate = $null,
+        [string]$SharePointBasePath = $null  # Optional prefix path in SharePoint (e.g., "etc")
     )
     
     Write-Host "Scanning file server: $RootPath..." -ForegroundColor Cyan
@@ -276,7 +277,13 @@ function Get-FileServerFiles {
             # File is locked - still report it but with limited info
             $relativePath = $fileInfo.FullName -replace [regex]::Escape($RootPath), ""
             $relativePath = $relativePath.TrimStart('\', '/')
-            $sharePointRelativePath = "$rootFolderName\$relativePath"
+            # Create SharePoint path with optional base path
+            if ($SharePointBasePath) {
+                $sharePointRelativePath = "$SharePointBasePath\$rootFolderName\$relativePath"
+            }
+            else {
+                $sharePointRelativePath = "$rootFolderName\$relativePath"
+            }
             $normalizedPath = Normalize-Path -Path $sharePointRelativePath
             
             $lockedFiles[$normalizedPath] = @{
@@ -335,8 +342,15 @@ function Get-FileServerFiles {
         $relativePath = $fileInfo.FullName -replace [regex]::Escape($RootPath), ""
         $relativePath = $relativePath.TrimStart('\', '/')
         
-        # Create SharePoint path: root folder name + relative path
-        $sharePointRelativePath = "$rootFolderName\$relativePath"
+        # Create SharePoint path: [base path] + root folder name + relative path
+        # If SharePointBasePath is specified (e.g., "etc"), path becomes "etc\clients\file.pdf"
+        # Otherwise, just "clients\file.pdf"
+        if ($SharePointBasePath) {
+            $sharePointRelativePath = "$SharePointBasePath\$rootFolderName\$relativePath"
+        }
+        else {
+            $sharePointRelativePath = "$rootFolderName\$relativePath"
+        }
         
         # Normalize path for comparison (lowercase, backslashes)
         $normalizedPath = Normalize-Path -Path $sharePointRelativePath
@@ -387,7 +401,10 @@ Write-Host ""
 
 # Step 1: Scan file server first (more efficient for large SharePoint sites)
 Write-Host "Step 1: Scanning file server..." -ForegroundColor Cyan
-$fileServerResult = Get-FileServerFiles -RootPath $config.FileServerPath -StartDate $startDate -EndDate $endDate
+# Get optional SharePoint base path (prefix folder in SharePoint)
+$sharePointBasePath = if ($config.SharePointBasePath) { $config.SharePointBasePath } else { $null }
+
+$fileServerResult = Get-FileServerFiles -RootPath $config.FileServerPath -StartDate $startDate -EndDate $endDate -SharePointBasePath $sharePointBasePath
 $fileServerFiles = $fileServerResult.Files
 $lockedFiles = $fileServerResult.LockedFiles
 

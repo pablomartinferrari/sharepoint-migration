@@ -5,6 +5,7 @@
   "SharePointSiteUrl": "https://yourtenant.sharepoint.com/sites/yoursite",
   "FileServerPath": "G:\\shared\\clients",
   "LibraryName": "Documents",
+  "SharePointBasePath": null,
   "StartDate": "2024-01-01",
   "EndDate": null
 }
@@ -12,8 +13,10 @@
 // Path Mapping:
 // - File Server: G:\shared\clients\client 1\my doc.pdf
 // - Root Path: G:\shared\clients
-// - SharePoint Path: clients\client 1\my doc.pdf
+// - SharePoint Path (without SharePointBasePath): clients\client 1\my doc.pdf
+// - SharePoint Path (with SharePointBasePath: "etc"): etc\clients\client 1\my doc.pdf
 // The last folder name in FileServerPath ("clients") will be included in SharePoint paths
+// SharePointBasePath (optional): Adds a prefix folder in SharePoint (e.g., "etc" creates "etc\clients\...")
 
 // Date Filtering (optional):
 // - StartDate: Include files created/modified after this date (format: "YYYY-MM-DD" or "YYYY-MM-DD HH:MM:SS")
