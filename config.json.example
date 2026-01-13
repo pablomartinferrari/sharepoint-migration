@@ -20,17 +20,28 @@
 // SharePointBasePath (optional): Adds a prefix folder in SharePoint (e.g., "etc" creates "etc\clients\...")
 //
 // FolderNameTransform (optional): Transform folder names during migration
-// Example: Simplify folder names by removing everything after the base name
+// 
+// Option 1: Use SimplifyFolders (recommended) - automatically removes everything after " (" or " -"
 //   "FolderNameTransform": {
 //     "SimplifyFolders": true,
 //     "NameMappings": {
 //       "Clients": "clients"
 //     }
 //   }
+//   This will transform "Clients (ETC - Wilco)" -> "Clients" (via SimplifyFolders) -> "clients" (via NameMappings)
+//
+// Option 2: Use NameMappings only - map exact folder names
+//   "FolderNameTransform": {
+//     "NameMappings": {
+//       "Clients (ETC - Wilco)": "clients"
+//     }
+//   }
+//   This maps the exact source folder name to the target name
+//
 // - SimplifyFolders: If true, removes everything after " (" or " -" from folder names
 //   Example: "Clients (ETC - Wilco)" -> "Clients", "Projects - Old" -> "Projects"
-// - NameMappings: Object mapping exact folder names to new names (applied after simplification)
-//   Example: "Clients" -> "clients" (case normalization)
+// - NameMappings: Object mapping exact folder names to new names (applied after simplification if SimplifyFolders is true)
+//   Example: "Clients" -> "clients" (case normalization) OR "Clients (ETC - Wilco)" -> "clients" (if not using SimplifyFolders)
 // - RemovePattern: Optional regex pattern for custom removal (advanced use)
 
 // Date Filtering (optional):

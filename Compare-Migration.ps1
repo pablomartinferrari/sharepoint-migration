@@ -390,14 +390,24 @@ function Get-FileServerFiles {
     # So "G:\Scanned Documents\folder1\file.pdf" becomes "Scanned Documents\folder1\file.pdf" in SharePoint
     $rootFolderName = Split-Path -Leaf $RootPath
     
+    # Apply transformation to root folder name for display
+    $transformedRootFolderName = if ($FolderNameTransform) {
+        Transform-FolderName -FolderName $rootFolderName -TransformConfig $FolderNameTransform
+    } else {
+        $rootFolderName
+    }
+    
     Write-Host "Root folder name: $rootFolderName" -ForegroundColor Gray
+    if ($transformedRootFolderName -ne $rootFolderName) {
+        Write-Host "  Transformed to: $transformedRootFolderName" -ForegroundColor Gray
+    }
     
     # Show the correct SharePoint path mapping including SharePointBasePath if provided
     if ($SharePointBasePath) {
-        Write-Host "  Files will be mapped to SharePoint path: $SharePointBasePath\$rootFolderName\<relative path>" -ForegroundColor Gray
+        Write-Host "  Files will be mapped to SharePoint path: $SharePointBasePath\$transformedRootFolderName\<relative path>" -ForegroundColor Gray
     }
     else {
-        Write-Host "  Files will be mapped to SharePoint path: $rootFolderName\<relative path>" -ForegroundColor Gray
+        Write-Host "  Files will be mapped to SharePoint path: $transformedRootFolderName\<relative path>" -ForegroundColor Gray
     }
     
     $files = @{}
